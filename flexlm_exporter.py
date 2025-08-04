@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class FlexLMExporter:
     """FlexLM License Server Exporter für Prometheus"""
     
-    def __init__(self, license_server: str = "localhost", port: int = 27000, lmutil_path: str = "lmutil"):
+    def __init__(self, license_server: str = "lic-solidworks-emea.patec.group", port: int = 25734, lmutil_path: str = "C:\Temp\SolidWorks_Exporter\FlexLM_Export\lmutil.exe"):
         self.license_server = license_server
         self.port = port
         self.lmutil_path = lmutil_path
