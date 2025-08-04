@@ -1,0 +1,77 @@
+# FlexLM Alerting Regeln für Prometheus
+# flexlm_alerts.yml
+
+groups:
+  - name: flexlm_licenses
+    rules:
+      # Wenige verfügbare Lizenzen
+      - alert: FlexLMLowLicenses
+        expr: flexlm_feature_available_licenses < 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Wenige {{ $labels.feature }} Lizenzen verfügbar"
+          description: "Nur {{ $value }} von {{ $labels.feature }} Lizenzen auf {{ $labels.server }} verfügbar."
+
+      # Alle Lizenzen ausgeschöpft
+      - alert: FlexLMNoLicensesAvailable
+        expr: flexlm_feature_available_licenses == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Keine {{ $labels.feature }} Lizenzen verfügbar!"
+          description: "Alle {{ $labels.feature }} Lizenzen auf {{ $labels.server }} sind in Verwendung."
+
+      # License Server nicht erreichbar
+      - alert: FlexLMServerDown
+        expr: flexlm_server_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "FlexLM Server {{ $labels.server }} nicht erreichbar"
+          description: "Der License Server {{ $labels.server }} ist seit mehr als 1 Minute nicht erreichbar."
+
+      # Daemon nicht verfügbar
+      - alert: FlexLMDaemonDown
+        expr: flexlm_daemon_up == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FlexLM Daemon {{ $labels.daemon }} nicht verfügbar"
+          description: "Der License Daemon {{ $labels.daemon }} auf {{ $labels.server }} ist nicht verfügbar."
+
+      # Hohe Lizenz-Auslastung (>80%)
+      - alert: FlexLMHighUtilization
+        expr: (flexlm_feature_used_licenses / flexlm_feature_total_licenses) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hohe Lizenz-Auslastung für {{ $labels.feature }}"
+          description: "{{ $labels.feature }} Lizenzen sind zu {{ $value | humanizePercentage }} ausgelastet auf {{ $labels.server }}."
+
+  - name: flexlm_scraping
+    rules:
+      # Scraping Fehler
+      - alert: FlexLMScrapingErrors
+        expr: increase(flexlm_scrape_errors_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fehler beim Sammeln der FlexLM Metriken"
+          description: "{{ $value }} Fehler beim Sammeln der FlexLM Metriken in den letzten 5 Minuten."
+
+      # Lange Scraping-Dauer
+      - alert: FlexLMSlowScraping
+        expr: flexlm_scrape_duration_seconds > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Langsame FlexLM Metrik-Sammlung"
+          description: "Das Sammeln der FlexLM Metriken dauert {{ $value }}s (>30s)."

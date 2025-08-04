@@ -1,0 +1,40 @@
+# Beispiel Prometheus Konfiguration für FlexLM Exporter
+# prometheus.yml
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  # FlexLM SolidWorks License Server
+  - job_name: 'flexlm-solidworks'
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    metrics_path: '/metrics'
+    
+    # Optional: Relabeling um Server-Informationen hinzuzufügen
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: localhost:9090
+
+  # Weitere FlexLM Server können hier hinzugefügt werden
+  # - job_name: 'flexlm-autocad'
+  #   static_configs:
+  #     - targets: ['cad-server:9091']
+
+# Alerting Regeln (optional)
+rule_files:
+  - "flexlm_alerts.yml"
+
+# Alertmanager Konfiguration (optional)
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
