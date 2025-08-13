@@ -144,32 +144,33 @@ class FlexLMExporter:
             'Anzahl der Fehler beim Sammeln der Metriken'
         )
 
-    def run_lmutil_command(self, command: str) -> Tuple[bool, str]:
-        """Führt einen lmutil-Befehl aus und gibt das Ergebnis zurück"""
+    def run_lmutil_command(self, args: List[str]) -> Tuple[int, str, str]:
+        """
+        Führt lmutil mit einer Liste von Argumenten aus.
+        Gibt (returncode, stdout, stderr) zurück.
+        """
+        cmd = [self.lmutil_path] + args
+        logger.debug(f"Calling lmutil: {cmd!r}")
+
         try:
-            full_command = f"{self.lmutil_path} {command}"
-            logger.debug(f"Ausführen: {full_command}")
-            
-            result = subprocess.run(
-                full_command,
-                shell=True,
+            res = subprocess.run(
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=30
             )
-            
-            if result.returncode == 0:
-                return True, result.stdout
-            else:
-                logger.error(f"lmutil Fehler: {result.stderr}")
-                return False, result.stderr
-                
-        except subprocess.TimeoutExpired:
-            logger.error("lmutil Befehl Timeout")
-            return False, "Timeout"
+            logger.debug(f"lmutil returncode={res.returncode}")
+            logger.debug(f"lmutil stdout:\n{res.stdout}")
+            logger.debug(f"lmutil stderr:\n{res.stderr}")
+            return res.returncode, res.stdout, res.stderr
+
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"lmutil timeout: {e}")
+            return -1, "", "TimeoutExpired"
         except Exception as e:
-            logger.error(f"Fehler beim Ausführen von lmutil: {e}")
-            return False, str(e)
+            logger.error(f"lmutil exception: {e}")
+            return -1, "", str(e)
+        
 
     def parse_lmstat_output(self, output: str) -> Dict:
         """Parsed die Ausgabe von lmstat -a"""
@@ -256,18 +257,21 @@ class FlexLMExporter:
         
         try:
             # lmstat -a ausführen für detaillierte Informationen
-            success, output = self.run_lmutil_command(f"lmstat -a -c {self.license_server}@{self.port}")
-            
-            if not success:
-                logger.error(f"Fehler beim Abrufen der Lizenzinformationen: {output}")
+            rc, output, error = self.run_lmutil_command([
+                "lmstat", "-a", "-c", f"{self.port}@{self.license_server}"
+            ])
+
+            # 2) Fehler-Metrik setzen
+            if rc != 0:
                 self.server_up.labels(server=f"{self.license_server}:{self.port}").set(0)
                 self.scrape_errors.inc()
+                logger.error("lmutil fehlerhaft, rc=%d, err=%s", rc, error)
                 return
-            
-            # Ausgabe parsen
+
+            # 3) Ausgabe verarbeiten
+            self.server_up.labels(server=f"{self.license_server}:{self.port}").set(1)
             data = self.parse_lmstat_output(output)
-            
-            # Server Status setzen
+
             server_label = f"{self.license_server}:{self.port}"
             self.server_up.labels(server=server_label).set(1 if data['server_status'] else 0)
             

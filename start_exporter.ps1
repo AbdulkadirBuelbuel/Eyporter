@@ -1,8 +1,8 @@
 # FlexLM Exporter PowerShell Startskript
 
 param(
-    [string]$LicenseServer = "localhost",
-    [int]$LicensePort = 27000,
+    [string]$LicenseServer = "lic-solidworks-emea.patec.group",
+    [int]$LicensePort = 25734,
     [int]$ExporterPort = 9090,
     [string]$LmutilPath = "lmutil",
     [switch]$Verbose,
@@ -42,7 +42,7 @@ $Args = @()
 
 if ($Demo) {
     Write-Host "Starte im Demo-Modus mit simulierten Daten..." -ForegroundColor Cyan
-    $Args += "demo_exporter.py"
+    $Args += "flexlm_exporter.py"
 } else {
     $Args += "flexlm_exporter.py"
     $Args += "--license-server", $LicenseServer
