@@ -7,6 +7,7 @@ Ermittelt Standortinformationen von Benutzern über Active Directory
 import os
 import time
 import logging
+import configparser
 from typing import Dict, Optional, List
 from dataclasses import dataclass
 
@@ -15,6 +16,7 @@ try:
     import win32api
     import win32con
     import win32security
+    import winreg
     from ldap3 import Server, Connection, ALL, SUBTREE, MODIFY_REPLACE
     AD_AVAILABLE = True
 except ImportError as e:
@@ -51,6 +53,20 @@ class ActiveDirectoryHelper:
         self.last_cache_update = 0
         self.enabled = AD_AVAILABLE
         
+        # Lade AD-Konfiguration aus Datei falls vorhanden
+        ad_config = self._load_ad_config()
+        
+        # Override mit expliziten Parametern
+        if self.ad_server is None:
+            self.ad_server = ad_config.get('server', '')
+        if self.username is None:
+            self.username = ad_config.get('username', '')
+        if self.password is None:
+            self.password = ad_config.get('password', '')
+        
+        # Cache-Timeout aus Konfiguration
+        self.cache_timeout = ad_config.get('cache_timeout', 300)
+        
         # Standard Attribute für Standort-Informationen
         self.location_attributes = location_attributes or [
             'l',           # Location/Stadt
@@ -69,6 +85,30 @@ class ActiveDirectoryHelper:
             self._initialize_connection()
         else:
             logger.warning("Active Directory nicht verfügbar - Standort-Features deaktiviert")
+    
+    def _load_ad_config(self) -> Dict[str, any]:
+        """Lädt AD-Konfiguration aus ad_config.ini"""
+        config = {}
+        config_file = "ad_config.ini"
+        
+        if os.path.exists(config_file):
+            try:
+                parser = configparser.ConfigParser()
+                parser.read(config_file)
+                
+                if 'ActiveDirectory' in parser:
+                    ad_section = parser['ActiveDirectory']
+                    config['server'] = ad_section.get('server', '').strip()
+                    config['username'] = ad_section.get('username', '').strip()
+                    config['password'] = ad_section.get('password', '').strip()
+                    config['cache_timeout'] = ad_section.getint('cache_timeout', 300)
+                    
+                    logger.info(f"AD-Konfiguration aus {config_file} geladen")
+                    
+            except Exception as e:
+                logger.warning(f"Fehler beim Laden der AD-Konfiguration: {e}")
+        
+        return config
     
     @staticmethod
     def detect_domain_environment() -> bool:
@@ -122,7 +162,8 @@ class ActiveDirectoryHelper:
             logger.debug(f"Domain-Erkennung fehlgeschlagen: {e}")
             return False
     
-    def _get_current_domain(self) -> str:
+    @classmethod
+    def _get_current_domain(cls) -> str:
         """Ermittelt die aktuelle Domain"""
         try:
             if AD_AVAILABLE:

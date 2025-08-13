@@ -69,11 +69,17 @@ class FlexLMExporter:
         if self.enable_ad:
             try:
                 logger.info("Initialisiere Active Directory Integration...")
-                self.ad_helper = ActiveDirectoryHelper(
-                    ad_server=ad_server,
-                    username=ad_username,
-                    password=ad_password
-                )
+                # Parameter für AD-Helper vorbereiten, falls übergeben
+                ad_kwargs = {}
+                if ad_server:
+                    ad_kwargs['ad_server'] = ad_server
+                if ad_username:
+                    ad_kwargs['username'] = ad_username
+                if ad_password:
+                    ad_kwargs['password'] = ad_password
+                
+                self.ad_helper = ActiveDirectoryHelper(**ad_kwargs)
+                
                 if self.ad_helper.is_enabled():
                     logger.info("✅ Active Directory Integration aktiviert")
                 else:
