@@ -39,12 +39,30 @@ class FlexLMExporter:
     
     def __init__(self, license_server: str = "lic-solidworks-emea.patec.group", port: int = 25734, 
                  lmutil_path: str = r"C:\Temp\SolidWorks_Exporter\FlexLM_Export\lmutil.exe",
-                 enable_ad: bool = False, ad_server: Optional[str] = None, 
+                 enable_ad: Optional[bool] = None, ad_server: Optional[str] = None, 
                  ad_username: Optional[str] = None, ad_password: Optional[str] = None):
         self.license_server = license_server
         self.port = port
         self.lmutil_path = lmutil_path
-        self.enable_ad = enable_ad and AD_INTEGRATION_AVAILABLE
+        
+        # AD-Integration automatisch basierend auf Umgebung aktivieren
+        if enable_ad is None:
+            # Automatische Erkennung
+            if AD_INTEGRATION_AVAILABLE:
+                auto_detected = ActiveDirectoryHelper.detect_domain_environment()
+                self.enable_ad = auto_detected
+                if auto_detected:
+                    logger.info("🔍 Domain-Umgebung erkannt - AD-Integration wird automatisch aktiviert")
+                else:
+                    logger.info("🔍 Keine Domain-Umgebung erkannt - AD-Integration bleibt deaktiviert")
+            else:
+                self.enable_ad = False
+                logger.info("ℹ️  AD-Module nicht verfügbar - AD-Integration deaktiviert")
+        else:
+            # Explizit vom Benutzer gesetzt
+            self.enable_ad = enable_ad and AD_INTEGRATION_AVAILABLE
+            if enable_ad and not AD_INTEGRATION_AVAILABLE:
+                logger.warning("⚠️  AD-Integration angefordert, aber Module nicht verfügbar")
         
         # Active Directory Helper initialisieren
         self.ad_helper = None
@@ -461,10 +479,10 @@ def main():
                        help='Verbose Logging aktivieren')
     
     # Active Directory Parameter
-    parser.add_argument('--enable-ad', action='store_true', default=False,
-                       help='Active Directory Integration aktivieren')
+    parser.add_argument('--enable-ad', action='store_true',
+                       help='Active Directory Integration explizit aktivieren')
     parser.add_argument('--disable-ad', action='store_true',
-                       help='Active Directory Integration explizit deaktivieren (Standard)')
+                       help='Active Directory Integration explizit deaktivieren')
     parser.add_argument('--ad-server', type=str,
                        help='Active Directory Server (optional, wird automatisch ermittelt)')
     parser.add_argument('--ad-username', type=str,
@@ -477,8 +495,13 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    # AD aktiviert/deaktiviert
-    enable_ad = args.enable_ad and not args.disable_ad
+    # AD-Aktivierung bestimmen
+    enable_ad = None  # Automatische Erkennung
+    if args.enable_ad:
+        enable_ad = True
+    elif args.disable_ad:
+        enable_ad = False
+    # Sonst bleibt enable_ad = None für automatische Erkennung
     
     # Exporter erstellen und starten
     exporter = FlexLMExporter(

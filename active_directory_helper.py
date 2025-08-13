@@ -70,6 +70,58 @@ class ActiveDirectoryHelper:
         else:
             logger.warning("Active Directory nicht verfügbar - Standort-Features deaktiviert")
     
+    @staticmethod
+    def detect_domain_environment() -> bool:
+        """Erkennt automatisch ob das System in einer Windows-Domain ist"""
+        try:
+            if not AD_AVAILABLE:
+                return False
+            
+            # Methode 1: Prüfe USERDOMAIN vs COMPUTERNAME
+            userdomain = os.environ.get('USERDOMAIN', '').upper()
+            computername = os.environ.get('COMPUTERNAME', '').upper()
+            
+            # Wenn USERDOMAIN != COMPUTERNAME und nicht WORKGROUP, dann Domain
+            if userdomain and computername and userdomain != computername and userdomain != 'WORKGROUP':
+                logger.debug(f"Domain erkannt über USERDOMAIN: {userdomain}")
+                return True
+            
+            # Methode 2: Prüfe USERDNSDOMAIN
+            userdnsdomain = os.environ.get('USERDNSDOMAIN', '')
+            if userdnsdomain and userdnsdomain.strip():
+                logger.debug(f"Domain erkannt über USERDNSDOMAIN: {userdnsdomain}")
+                return True
+            
+            # Methode 3: Prüfe mit win32api
+            try:
+                import win32api
+                import win32con
+                domain_info = win32api.GetComputerNameEx(win32con.ComputerNameDnsDomain)
+                if domain_info and domain_info.strip() and domain_info.lower() != 'localhost':
+                    logger.debug(f"Domain erkannt über win32api: {domain_info}")
+                    return True
+            except Exception as e:
+                logger.debug(f"win32api Domain-Check fehlgeschlagen: {e}")
+            
+            # Methode 4: Prüfe Registry
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, 
+                                  r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters") as key:
+                    domain, _ = winreg.QueryValueEx(key, "Domain")
+                    if domain and domain.strip():
+                        logger.debug(f"Domain erkannt über Registry: {domain}")
+                        return True
+            except Exception as e:
+                logger.debug(f"Registry Domain-Check fehlgeschlagen: {e}")
+            
+            logger.debug("Keine Domain-Umgebung erkannt")
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Domain-Erkennung fehlgeschlagen: {e}")
+            return False
+    
     def _get_current_domain(self) -> str:
         """Ermittelt die aktuelle Domain"""
         try:
