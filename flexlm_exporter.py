@@ -5,6 +5,7 @@ Speziell für SolidWorks Lizenzserver
 
 Dieser Exporter sammelt Informationen von FlexLM-basierten Lizenzservern
 und stellt sie als Prometheus-Metriken zur Verfügung.
+Erweitert um Active Directory Integration für Standort-Informationen.
 """
 
 import time
@@ -17,6 +18,14 @@ import threading
 from prometheus_client import Counter, Gauge, Info, start_http_server, REGISTRY
 from prometheus_client.core import CollectorRegistry
 
+# Active Directory Helper importieren
+try:
+    from active_directory_helper import ActiveDirectoryHelper
+    AD_INTEGRATION_AVAILABLE = True
+except ImportError as e:
+    AD_INTEGRATION_AVAILABLE = False
+    print(f"WARNUNG: Active Directory Integration nicht verfügbar: {e}")
+
 # Logging konfigurieren
 logging.basicConfig(
     level=logging.INFO,
@@ -28,10 +37,32 @@ logger = logging.getLogger(__name__)
 class FlexLMExporter:
     """FlexLM License Server Exporter für Prometheus"""
     
-    def __init__(self, license_server: str = "lic-solidworks-emea.patec.group", port: int = 25734, lmutil_path: str = "C:\Temp\SolidWorks_Exporter\FlexLM_Export\lmutil.exe"):
+    def __init__(self, license_server: str = "lic-solidworks-emea.patec.group", port: int = 25734, 
+                 lmutil_path: str = r"C:\Temp\SolidWorks_Exporter\FlexLM_Export\lmutil.exe",
+                 enable_ad: bool = True, ad_server: Optional[str] = None, 
+                 ad_username: Optional[str] = None, ad_password: Optional[str] = None):
         self.license_server = license_server
         self.port = port
         self.lmutil_path = lmutil_path
+        self.enable_ad = enable_ad and AD_INTEGRATION_AVAILABLE
+        
+        # Active Directory Helper initialisieren
+        self.ad_helper = None
+        if self.enable_ad:
+            try:
+                self.ad_helper = ActiveDirectoryHelper(
+                    ad_server=ad_server,
+                    username=ad_username,
+                    password=ad_password
+                )
+                if self.ad_helper.is_enabled():
+                    logger.info("Active Directory Integration aktiviert")
+                else:
+                    logger.warning("Active Directory Integration fehlgeschlagen")
+                    self.enable_ad = False
+            except Exception as e:
+                logger.error(f"Fehler bei AD-Initialisierung: {e}")
+                self.enable_ad = False
         
         # Prometheus Metriken definieren
         self.setup_metrics()
@@ -68,18 +99,31 @@ class FlexLMExporter:
             ['server', 'vendor', 'feature']
         )
         
-        # Benutzer Informationen
+        # Benutzer Informationen (erweitert um Standort)
         self.user_licenses = Gauge(
             'flexlm_user_licenses',
             'Anzahl der von einem Benutzer verwendeten Lizenzen',
-            ['server', 'vendor', 'feature', 'user', 'hostname', 'display']
+            ['server', 'vendor', 'feature', 'user', 'hostname', 'display', 'location', 'department']
+        )
+        
+        # Standort-spezifische Metriken
+        self.location_licenses = Gauge(
+            'flexlm_location_licenses_total',
+            'Gesamtanzahl der Lizenzen pro Standort',
+            ['server', 'location', 'feature']
+        )
+        
+        self.location_users = Gauge(
+            'flexlm_location_users_total',
+            'Anzahl der Benutzer pro Standort',
+            ['server', 'location']
         )
         
         # Computer/Hostname Informationen
         self.host_licenses = Gauge(
             'flexlm_host_licenses_total',
             'Gesamtanzahl der Lizenzen pro Host',
-            ['server', 'hostname']
+            ['server', 'hostname', 'location']
         )
         
         # Daemon Status
@@ -257,31 +301,95 @@ class FlexLMExporter:
                     feature=feature['name']
                 ).set(feature['available'])
                 
-                # Benutzer-spezifische Metriken
+                # Benutzer-spezifische Metriken (erweitert um AD-Informationen)
+                location_counts = {}  # Zähler für Standorte
+                
                 for user in feature['users']:
+                    # Standort-Informationen aus AD abrufen
+                    location = "Unknown"
+                    department = "Unknown"
+                    
+                    if self.enable_ad and self.ad_helper:
+                        try:
+                            user_info = self.ad_helper.get_user_info(user['username'])
+                            location = user_info.location if user_info.location else "Unknown"
+                            department = user_info.department if user_info.department else "Unknown"
+                            logger.debug(f"AD Info für {user['username']}: {location}, {department}")
+                        except Exception as e:
+                            logger.warning(f"AD-Abfrage für {user['username']} fehlgeschlagen: {e}")
+                    
+                    # Benutzer-Metrik mit Standort
                     self.user_licenses.labels(
                         server=server_label,
                         vendor=vendor,
                         feature=feature['name'],
                         user=user['username'],
                         hostname=user['hostname'],
-                        display=user['display']
+                        display=user['display'],
+                        location=location,
+                        department=department
                     ).set(1)  # 1 Lizenz pro Benutzer/Feature Kombination
+                    
+                    # Standort-Zähler aktualisieren
+                    location_key = f"{location}_{feature['name']}"
+                    if location_key in location_counts:
+                        location_counts[location_key] += 1
+                    else:
+                        location_counts[location_key] = 1
+                
+                # Standort-basierte Metriken setzen
+                for location_key, count in location_counts.items():
+                    location, feature_name = location_key.rsplit('_', 1)
+                    self.location_licenses.labels(
+                        server=server_label,
+                        location=location,
+                        feature=feature_name
+                    ).set(count)
             
-            # Host-basierte Metriken (Computer-Namen aggregieren)
+            # Host-basierte Metriken (Computer-Namen aggregieren) - erweitert um Standort
             host_counts = {}
+            location_user_counts = {}
+            
             for user in data['users']:
                 hostname = user['hostname']
-                if hostname in host_counts:
-                    host_counts[hostname] += 1
+                
+                # Standort für Host ermitteln
+                location = "Unknown"
+                if self.enable_ad and self.ad_helper:
+                    try:
+                        user_info = self.ad_helper.get_user_info(user['username'])
+                        location = user_info.location if user_info.location else "Unknown"
+                    except Exception:
+                        pass
+                
+                # Host-Zähler
+                host_key = f"{hostname}_{location}"
+                if host_key in host_counts:
+                    host_counts[host_key] += 1
                 else:
-                    host_counts[hostname] = 1
+                    host_counts[host_key] = 1
+                
+                # Benutzer pro Standort zählen
+                if location in location_user_counts:
+                    location_user_counts[location].add(user['username'])
+                else:
+                    location_user_counts[location] = {user['username']}
             
-            for hostname, count in host_counts.items():
+            # Host-Metriken setzen
+            for host_key, count in host_counts.items():
+                hostname, location = host_key.rsplit('_', 1)
                 self.host_licenses.labels(
                     server=server_label,
-                    hostname=hostname
+                    hostname=hostname,
+                    location=location
                 ).set(count)
+            
+            # Benutzer pro Standort Metriken
+            for location, users in location_user_counts.items():
+                self.location_users.labels(
+                    server=server_label,
+                    location=location
+                ).set(len(users))
             
             logger.info(f"Metriken erfolgreich gesammelt. Features: {len(data['features'])}, Users: {len(data['users'])}")
             
@@ -332,28 +440,47 @@ def main():
     """Hauptfunktion"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='FlexLM License Server Exporter für Prometheus')
-    parser.add_argument('--license-server', default='localhost', 
-                       help='FlexLM License Server Hostname/IP (default: localhost)')
-    parser.add_argument('--license-port', type=int, default=27000,
-                       help='FlexLM License Server Port (default: 27000)')
+    parser = argparse.ArgumentParser(description='FlexLM License Server Exporter für Prometheus mit Active Directory Integration')
+    parser.add_argument('--license-server', default='lic-solidworks-emea.patec.group', 
+                       help='FlexLM License Server Hostname/IP (default: lic-solidworks-emea.patec.group)')
+    parser.add_argument('--license-port', type=int, default=25734,
+                       help='FlexLM License Server Port (default: 25734)')
     parser.add_argument('--exporter-port', type=int, default=9090,
                        help='Port für den Prometheus Exporter (default: 9090)')
-    parser.add_argument('--lmutil-path', default='lmutil',
-                       help='Pfad zur lmutil Binary (default: lmutil im PATH)')
+    parser.add_argument('--lmutil-path', default=r'C:\Temp\SolidWorks_Exporter\FlexLM_Export\lmutil.exe',
+                       help='Pfad zur lmutil Binary (default: C:\\Temp\\SolidWorks_Exporter\\FlexLM_Export\\lmutil.exe)')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Verbose Logging aktivieren')
+    
+    # Active Directory Parameter
+    parser.add_argument('--enable-ad', action='store_true', default=True,
+                       help='Active Directory Integration aktivieren (default: True)')
+    parser.add_argument('--disable-ad', action='store_true',
+                       help='Active Directory Integration deaktivieren')
+    parser.add_argument('--ad-server', type=str,
+                       help='Active Directory Server (optional, wird automatisch ermittelt)')
+    parser.add_argument('--ad-username', type=str,
+                       help='AD Benutzername für explizite Anmeldung (optional)')
+    parser.add_argument('--ad-password', type=str,
+                       help='AD Passwort für explizite Anmeldung (optional)')
     
     args = parser.parse_args()
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # AD aktiviert/deaktiviert
+    enable_ad = args.enable_ad and not args.disable_ad
+    
     # Exporter erstellen und starten
     exporter = FlexLMExporter(
         license_server=args.license_server,
         port=args.license_port,
-        lmutil_path=args.lmutil_path
+        lmutil_path=args.lmutil_path,
+        enable_ad=enable_ad,
+        ad_server=args.ad_server,
+        ad_username=args.ad_username,
+        ad_password=args.ad_password
     )
     
     exporter.start_server(args.exporter_port)
