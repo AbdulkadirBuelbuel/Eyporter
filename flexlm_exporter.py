@@ -39,7 +39,7 @@ class FlexLMExporter:
     
     def __init__(self, license_server: str = "lic-solidworks-emea.patec.group", port: int = 25734, 
                  lmutil_path: str = r"C:\Temp\SolidWorks_Exporter\FlexLM_Export\lmutil.exe",
-                 enable_ad: bool = True, ad_server: Optional[str] = None, 
+                 enable_ad: bool = False, ad_server: Optional[str] = None, 
                  ad_username: Optional[str] = None, ad_password: Optional[str] = None):
         self.license_server = license_server
         self.port = port
@@ -50,19 +50,23 @@ class FlexLMExporter:
         self.ad_helper = None
         if self.enable_ad:
             try:
+                logger.info("Initialisiere Active Directory Integration...")
                 self.ad_helper = ActiveDirectoryHelper(
                     ad_server=ad_server,
                     username=ad_username,
                     password=ad_password
                 )
                 if self.ad_helper.is_enabled():
-                    logger.info("Active Directory Integration aktiviert")
+                    logger.info("✅ Active Directory Integration aktiviert")
                 else:
-                    logger.warning("Active Directory Integration fehlgeschlagen")
+                    logger.info("ℹ️  Active Directory Integration nicht verfügbar (läuft ohne Standort-Features)")
                     self.enable_ad = False
             except Exception as e:
-                logger.error(f"Fehler bei AD-Initialisierung: {e}")
+                logger.warning(f"⚠️  AD-Initialisierung fehlgeschlagen: {e}")
+                logger.info("ℹ️  Exporter läuft ohne Active Directory Integration")
                 self.enable_ad = False
+        else:
+            logger.info("ℹ️  Active Directory Integration deaktiviert")
         
         # Prometheus Metriken definieren
         self.setup_metrics()
@@ -457,10 +461,10 @@ def main():
                        help='Verbose Logging aktivieren')
     
     # Active Directory Parameter
-    parser.add_argument('--enable-ad', action='store_true', default=True,
-                       help='Active Directory Integration aktivieren (default: True)')
+    parser.add_argument('--enable-ad', action='store_true', default=False,
+                       help='Active Directory Integration aktivieren')
     parser.add_argument('--disable-ad', action='store_true',
-                       help='Active Directory Integration deaktivieren')
+                       help='Active Directory Integration explizit deaktivieren (Standard)')
     parser.add_argument('--ad-server', type=str,
                        help='Active Directory Server (optional, wird automatisch ermittelt)')
     parser.add_argument('--ad-username', type=str,

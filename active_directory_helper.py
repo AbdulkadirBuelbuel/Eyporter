@@ -4,6 +4,7 @@ Active Directory Helper für FlexLM Exporter
 Ermittelt Standortinformationen von Benutzern über Active Directory
 """
 
+import os
 import time
 import logging
 from typing import Dict, Optional, List
@@ -73,10 +74,40 @@ class ActiveDirectoryHelper:
         """Ermittelt die aktuelle Domain"""
         try:
             if AD_AVAILABLE:
-                domain_info = win32api.GetComputerNameEx(win32con.ComputerNameDnsDomain)
-                return domain_info if domain_info else "localhost"
+                # Verschiedene Methoden zum Ermitteln der Domain probieren
+                try:
+                    domain_info = win32api.GetComputerNameEx(win32con.ComputerNameDnsDomain)
+                    if domain_info and domain_info.strip():
+                        logger.debug(f"Domain gefunden: {domain_info}")
+                        return domain_info.strip()
+                except Exception as e:
+                    logger.debug(f"GetComputerNameEx fehlgeschlagen: {e}")
+                
+                # Fallback: Versuche über Umgebungsvariablen
+                try:
+                    domain = os.environ.get('USERDNSDOMAIN') or os.environ.get('USERDOMAIN')
+                    if domain and domain.strip() and domain.upper() != 'WORKGROUP':
+                        logger.debug(f"Domain über Umgebungsvariable gefunden: {domain}")
+                        return domain.strip()
+                except Exception as e:
+                    logger.debug(f"Umgebungsvariable-Abfrage fehlgeschlagen: {e}")
+                
+                # Fallback: Versuche über Registry
+                try:
+                    import winreg
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, 
+                                      r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters") as key:
+                        domain, _ = winreg.QueryValueEx(key, "Domain")
+                        if domain and domain.strip():
+                            logger.debug(f"Domain über Registry gefunden: {domain}")
+                            return domain.strip()
+                except Exception as e:
+                    logger.debug(f"Registry-Abfrage fehlgeschlagen: {e}")
+                    
         except Exception as e:
-            logger.warning(f"Konnte Domain nicht ermitteln: {e}")
+            logger.debug(f"Allgemeiner Fehler bei Domain-Ermittlung: {e}")
+        
+        logger.info("Keine Windows-Domain gefunden - verwende localhost")
         return "localhost"
     
     def _initialize_connection(self):
@@ -85,22 +116,63 @@ class ActiveDirectoryHelper:
             return False
             
         try:
+            # Prüfe erst, ob wir überhaupt in einer Domain sind
+            if self.domain == "localhost" or not self.domain:
+                logger.info("Nicht in einer Windows-Domain - AD-Integration deaktiviert")
+                self.enabled = False
+                return False
+            
             if not self.ad_server:
                 # Versuche Domain Controller automatisch zu finden
                 self.ad_server = self.domain
             
-            server = Server(self.ad_server, get_info=ALL)
+            logger.debug(f"Versuche AD-Verbindung zu: {self.ad_server}")
+            
+            # Timeout für Server-Verbindung setzen
+            server = Server(self.ad_server, get_info=ALL, connect_timeout=5)
             
             if self.username and self.password:
                 # Explizite Anmeldung
                 user_dn = f"{self.username}@{self.domain}"
-                self.connection = Connection(server, user=user_dn, password=self.password, auto_bind=True)
+                self.connection = Connection(
+                    server, 
+                    user=user_dn, 
+                    password=self.password, 
+                    auto_bind=True,
+                    read_only=True,
+                    raise_exceptions=False
+                )
             else:
                 # Versuche mit aktuellen Windows-Credentials
-                self.connection = Connection(server, auto_bind=True, authentication='NTLM')
+                self.connection = Connection(
+                    server, 
+                    auto_bind=True, 
+                    authentication='NTLM',
+                    read_only=True,
+                    raise_exceptions=False
+                )
             
-            logger.info(f"Active Directory Verbindung erfolgreich: {self.ad_server}")
-            return True
+            # Teste die Verbindung mit einer einfachen Abfrage
+            if self.connection and self.connection.bound:
+                # Teste mit einer einfachen Abfrage
+                test_result = self.connection.search(
+                    search_base="",
+                    search_filter="(objectClass=*)",
+                    search_scope="BASE",
+                    size_limit=1
+                )
+                
+                if test_result or not self.connection.last_error:
+                    logger.info(f"Active Directory Verbindung erfolgreich: {self.ad_server}")
+                    return True
+                else:
+                    logger.warning(f"AD-Verbindung funktioniert nicht richtig: {self.connection.last_error}")
+                    self.enabled = False
+                    return False
+            else:
+                logger.warning("AD-Verbindung konnte nicht aufgebaut werden")
+                self.enabled = False
+                return False
             
         except Exception as e:
             logger.error(f"Fehler beim Verbinden mit Active Directory: {e}")

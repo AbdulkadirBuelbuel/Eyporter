@@ -6,7 +6,8 @@ param(
     [int]$ExporterPort = 9090,
     [string]$LmutilPath = "lmutil",
     [switch]$Verbose,
-    [switch]$Demo
+    [switch]$Demo,
+    [switch]$EnableAD
 )
 
 Write-Host "FlexLM License Server Exporter" -ForegroundColor Green
@@ -49,6 +50,14 @@ if ($Demo) {
     $Args += "--license-port", $LicensePort.ToString()
     $Args += "--exporter-port", $ExporterPort.ToString()
     $Args += "--lmutil-path", $LmutilPath
+    
+    # AD-Integration nur wenn explizit aktiviert
+    if ($EnableAD) {
+        $Args += "--enable-ad"
+        Write-Host "  AD-Integration: Aktiviert" -ForegroundColor Green
+    } else {
+        Write-Host "  AD-Integration: Deaktiviert (Standard)" -ForegroundColor Yellow
+    }
     
     if ($Verbose) {
         $Args += "--verbose"
