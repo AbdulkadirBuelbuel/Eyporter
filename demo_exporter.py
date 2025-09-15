@@ -34,16 +34,14 @@ Feature usage info:
 Users of SOLIDWORKS:  (Total of 15 licenses issued;  Total of 8 licenses in use)
 
   "SOLIDWORKS" v2023.0400, vendor: SolidWorksNetworkLicense
-  floating license
-
-    mueller ENGR-WS001 ENGR-WS001 (v2023.0400) (localhost/27000 1234), start Mon 8/4 08:30
-    schmidt CAD-PC-05 CAD-PC-05 (v2023.0400) (localhost/27000 1235), start Mon 8/4 09:15
-    weber DESIGN-01 DESIGN-01 (v2023.0400) (localhost/27000 1236), start Mon 8/4 09:45
-    fischer LAPTOP-ENGR LAPTOP-ENGR (v2023.0400) (localhost/27000 1237), start Mon 8/4 10:20
-    bauer WORKSTATION-A WORKSTATION-A (v2023.0400) (localhost/27000 1238), start Mon 8/4 11:00
-    meyer CAD-STATION-12 CAD-STATION-12 (v2023.0400) (localhost/27000 1239), start Mon 8/4 11:30
-    wagner MOBILE-CAD-01 MOBILE-CAD-01 (v2023.0400) (localhost/27000 1240), start Mon 8/4 12:00
-    admin ADMIN-PC ADMIN-PC (v2023.0400) (localhost/27000 1241), start Mon 8/4 13:00
+  floating license    mueller ENGR-WS001 ENGR-WS001 (v2023.0400) (localhost/27000 1234), start Mon 8/4 08:30
+    bla99bng CAD-PC-05 CAD-PC-05 (v2023.0400) (localhost/27000 1235), start Mon 8/4 09:15
+    user123fra DESIGN-01 DESIGN-01 (v2023.0400) (localhost/27000 1236), start Mon 8/4 09:45
+    test42muc LAPTOP-ENGR LAPTOP-ENGR (v2023.0400) (localhost/27000 1237), start Mon 8/4 10:20
+    admin1dus WORKSTATION-A WORKSTATION-A (v2023.0400) (localhost/27000 1238), start Mon 8/4 11:00
+    john007lon CAD-STATION-12 CAD-STATION-12 (v2023.0400) (localhost/27000 1239), start Mon 8/4 11:30
+    marie56par MOBILE-CAD-01 MOBILE-CAD-01 (v2023.0400) (localhost/27000 1240), start Mon 8/4 12:00
+    peter88ber ADMIN-PC ADMIN-PC (v2023.0400) (localhost/27000 1241), start Mon 8/4 13:00
 
 Users of COSMOSWORKS:  (Total of 8 licenses issued;  Total of 3 licenses in use)
 
@@ -64,21 +62,16 @@ Users of PDMWORKS:  (Total of 5 licenses issued;  Total of 2 licenses in use)
 """
 
 def mock_run_lmutil_command(self, command):
-    """Mock-Funktion für lmutil Aufrufe"""
-    # Simuliere verschiedene Zustände basierend auf der Zeit
+    """Mock-Funktion für lmutil Aufrufe, liefert (rc, stdout, stderr)."""
     current_time = time.time()
-    
-    # Alle 60 Sekunden ändert sich die Anzahl der Benutzer
     if int(current_time) % 60 < 30:
-        return True, create_mock_lmstat_output()
+        return 0, create_mock_lmstat_output(), ""
     else:
-        # Reduzierte Benutzeranzahl
         reduced_output = create_mock_lmstat_output().replace(
             'Total of 8 licenses in use', 'Total of 5 licenses in use'
         ).replace(
             'Total of 3 licenses in use', 'Total of 2 licenses in use'
         )
-        # Entferne einige Benutzer-Zeilen
         lines = reduced_output.split('\n')
         filtered_lines = []
         skip_next = 0
@@ -90,8 +83,7 @@ def mock_run_lmutil_command(self, command):
                 skip_next = 0
                 continue
             filtered_lines.append(line)
-        
-        return True, '\n'.join(filtered_lines)
+        return 0, '\n'.join(filtered_lines), ""
 
 def main():
     """Startet den Demo-Exporter"""

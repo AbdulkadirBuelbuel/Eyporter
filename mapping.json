@@ -1,0 +1,32 @@
+{
+  "location_mapping": {
+    
+    "bri": "Bristol",
+    "cr": "Crailsheim",
+    "did": "Dierdorf",
+    "goa": "Goa",
+    "hz2": "Hangzhou",
+    "kre": "Krefeld",
+    "nrd": "New Richmond",
+    "DCR": "New Richmond",
+    "npm": "New Richmond",
+    "pec": "Pecel",
+    "ral": "Raleigh",
+    "rem": "Remshalden",
+    "sdm": "Rotterdam",
+    "san": "Sandved", 
+    "scm": "Schopfheim",
+    "sha": "Shanghai",
+    "to": "Shibuya",
+    "tez": "Ternitz",
+    "tor": "Toronto",
+    "trc": "Trencin",
+    "vra": "Verna", 
+    "ban": "Verna",
+    "wa2": "Waiblingen",
+    "wee": "Weert", 
+    "si":  ""
+
+
+  }
+}

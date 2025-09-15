@@ -1,0 +1,93 @@
+lmutil - Copyright (c) 1989-2023 Flexera. All Rights Reserved.
+Flexible License Manager status on Wed 9/3/2025 13:03
+
+[Detecting lmgrd processes...]
+License server status: 25734@nrdvmp004
+    License file(s) on nrdvmp004: D:\Program Files (x86)\SOLIDWORKS Corp\SolidNetWork License Manager\licenses\sw_d.lic:
+
+ nrdvmp004: license server UP (MASTER) v11.19.6
+
+Vendor daemon status (on nrdvmp004):
+
+      SW_D: UP v11.19.6
+Feature usage info:
+
+Users of cae_cwstd:  (Total of 2 licenses issued;  Total of 1 license in use)
+
+  "cae_cwstd" v32.0, vendor: SW_D, expiry: 03-dec-2026
+  vendor_string: NTSR000106648-01 sd=12-03-2024
+  floating license
+
+    LIX11HZ2 HZ2-VDI027 PC-4CV910WV8S (v31.0) (nrdvmp004/25734 856), start Wed 9/3 12:34
+
+Users of cae_cosmosfloworkspe:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of swofficepremium:  (Total of 5 licenses issued;  Total of 0 licenses in use)
+
+Users of solidworks:  (Total of 136 licenses issued;  Total of 14 licenses in use)
+
+  "solidworks" v32.0, vendor: SW_D, expiry: 03-dec-2026
+  vendor_string: NTSR000106648-01 sd=12-03-2024
+  floating license
+
+    VLN1VRA PC-PF58K8JL PC-PF58K8JL (v31.0) (nrdvmp004/25734 5872), start Wed 9/3 8:09
+    DIS4VRA PC-4CE9120RQP PC-4CE9120RQP (v31.0) (nrdvmp004/25734 1961), start Wed 9/3 10:33
+    MKH1VRA VDI00000000LsKn VDI00000000LsKn (v31.0) (nrdvmp004/25734 477), start Wed 9/3 10:35
+    CNT2HZ2 HZ2-VDI035 PC-4CV947WVCM (v31.0) (nrdvmp004/25734 223), start Wed 9/3 11:22
+    CGU2HZ2 HZ2-VDI014 HZ2FA101681 (v31.0) (nrdvmp004/25734 6756), start Wed 9/3 11:24
+    WGY14HZ2 HZ2-VDI021 HZ2FA101918 (v31.0) (nrdvmp004/25734 4791), start Wed 9/3 12:10
+    RSA1VRA VRAVDI009 VRAVDI009 (v31.0) (nrdvmp004/25734 5290), start Wed 9/3 12:11
+    MGJ1HZ2 HZ2-VDI012 PC-4CV947WVCH (v31.0) (nrdvmp004/25734 2195), start Wed 9/3 12:13
+    YUM1HZ2 HZ2-VDI081 PC-4CV911W12P (v31.0) (nrdvmp004/25734 1311), start Wed 9/3 12:21
+    zrh1hz2 VDI00000000fKPX PC-PW08RQDW (v31.0) (nrdvmp004/25734 3977), start Wed 9/3 12:28
+    LIX11HZ2 HZ2-VDI027 PC-4CV910WV8S (v31.0) (nrdvmp004/25734 2899), start Wed 9/3 12:34
+    YLA1HZ2 VDI00000000gJWD PC-PF3VJEGL (v31.0) (nrdvmp004/25734 3535), start Wed 9/3 12:37
+    MER1NRD VDI00000000MYMG VDI00000000MYMG (v31.0) (nrdvmp004/25734 5966), start Wed 9/3 12:57
+    OAM5ALV VDI00000000nQ3x VDI00000000nQ3x (v31.0) (nrdvmp004/25734 4576), start Wed 9/3 12:57
+
+Users of cae_cwpro:  (Total of 2 licenses issued;  Total of 2 licenses in use)
+
+  "cae_cwpro" v32.0, vendor: SW_D, expiry: 03-dec-2026
+  vendor_string: NTSR000106648-01 sd=12-03-2024
+  floating license
+
+    DIS4VRA PC-4CE9120RQP PC-4CE9120RQP (v31.0) (nrdvmp004/25734 6277), start Wed 9/3 10:33
+    YLA1HZ2 VDI00000000gJWD PC-PF3VJEGL (v31.0) (nrdvmp004/25734 1589), start Wed 9/3 12:37
+
+Users of swofficepro:  (Total of 10 licenses issued;  Total of 6 licenses in use)
+
+  "swofficepro" v32.0, vendor: SW_D, expiry: 03-dec-2026
+  vendor_string: NTSR000106648-01 sd=12-03-2024
+  floating license
+
+    GRJ1REM PC-PF1VAF9M PC-PF1VAF9M (v12.0) (nrdvmp004/25734 6883), start Wed 9/3 7:50
+    HLM2BNG PC-PF2F53AV PC-PF2F53AV (v12.0) (nrdvmp004/25734 6968), start Wed 9/3 9:57
+    BLM1CR PC01005 PC01005 (v12.0) (nrdvmp004/25734 2626), start Wed 9/3 8:18
+    BAF1GOA REM-VDI010 REM-VDI010 (v12.0) (nrdvmp004/25734 2457), start Wed 9/3 9:40
+    SDR1BRI PC01173 PC01173 (v31.0) (nrdvmp004/25734 1220), start Wed 9/3 12:15
+    WSN1WEE PCWEE-VDI019 PCWEE-VDI019 (v31.0) (nrdvmp004/25734 1787), start Wed 9/3 12:45
+
+Users of cae_cwadvpro:  (Total of 2 licenses issued;  Total of 0 licenses in use)
+
+Users of swcomposer:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of camstd:  (Total of 136 licenses issued;  Total of 0 licenses in use)
+
+Users of visustd:  (Total of 15 licenses issued;  Total of 0 licenses in use)
+
+Users of draftsightpremium:  (Total of 15 licenses issued;  Total of 4 licenses in use)
+
+  "draftsightpremium" v32.0, vendor: SW_D, expiry: 03-dec-2026
+  vendor_string: NTSR000106648-01 sd=12-03-2024
+  floating license
+
+    FTS1BNG PC-PF3S8W1R PC-PF3S8W1R (v31.0) (nrdvmp004/25734 640), start Wed 9/3 12:37
+    WDJ1BNG PC-PW067758 PC-PW067758 (v31.0) (nrdvmp004/25734 3652), start Wed 9/3 12:50
+    brt2bng PC-PF4GE79P PC-PF4GE79P (v31.0) (nrdvmp004/25734 6568), start Wed 9/3 12:57
+    KZK1BNG PC-PW06774K PC-PW06774K (v31.0) (nrdvmp004/25734 4007), start Wed 9/3 12:59
+
+
+
+--- STDERR ---
+
+RC=0

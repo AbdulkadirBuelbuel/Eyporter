@@ -1,6 +1,10 @@
 @echo off
 REM FlexLM Exporter Startskript für Windows
 
+setlocal
+
+set MAPPING_FILE=mapping.json
+
 echo Starting FlexLM Exporter...
 echo.
 
@@ -37,9 +41,7 @@ if exist "requirements.txt" (
 
 REM Starte den Exporter
 echo Starte FlexLM Exporter auf http://localhost:9090/metrics
-echo Drücken Sie Ctrl+C zum Beenden...
-echo.
-
-python flexlm_exporter.py --verbose
+set CMD_ARGS=--verbose --mapping-file "%MAPPING_FILE%"
+python flexlm_exporter.py %CMD_ARGS%
 
 pause

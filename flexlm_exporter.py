@@ -1,527 +1,318 @@
 #!/usr/bin/env python3
 """
-FlexLM License Server Exporter for Prometheus
-Speziell für SolidWorks Lizenzserver
-
-Dieser Exporter sammelt Informationen von FlexLM-basierten Lizenzservern
-und stellt sie als Prometheus-Metriken zur Verfügung.
-Erweitert um Active Directory Integration für Standort-Informationen.
+FlexLM License Server Exporter for Prometheus (SolidWorks Fokus)
+Mit Username -> Location Mapping und Multi-Server YAML Support.
 """
-
-import time
-import subprocess
-import re
-import logging
+import time, subprocess, re, logging, threading, os, sys
 from typing import Dict, List, Tuple, Optional
-from datetime import datetime
-import threading
-from prometheus_client import Counter, Gauge, Info, start_http_server, REGISTRY
-from prometheus_client.core import CollectorRegistry
+from dataclasses import dataclass
+from prometheus_client import Counter, Gauge, start_http_server, REGISTRY
 
-# Active Directory Helper importieren
+# Username Location Mapper
 try:
-    from active_directory_helper import ActiveDirectoryHelper
-    AD_INTEGRATION_AVAILABLE = True
+    from username_location_mapper import UsernameLocationMapper
+    USERNAME_MAPPING_AVAILABLE = True
 except ImportError as e:
-    AD_INTEGRATION_AVAILABLE = False
-    print(f"WARNUNG: Active Directory Integration nicht verfügbar: {e}")
+    USERNAME_MAPPING_AVAILABLE = False
+    print(f"WARNUNG: Username Location Mapping nicht verfügbar: {e}")
 
-# Logging konfigurieren
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except Exception:
+    YAML_AVAILABLE = False
+
+def _app_base_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+@dataclass
+class FlexLMServerTarget:
+    host: str
+    port: int
+    lmutil_path: str
 
 class FlexLMExporter:
-    """FlexLM License Server Exporter für Prometheus"""
-    
-    def __init__(self, license_server: str = "lic-solidworks-emea.patec.group", port: int = 25734, 
+    def __init__(self,
+                 license_server: str = "lic-solidworks-emea.patec.group",
+                 port: int = 25734,
                  lmutil_path: str = r"C:\Temp\SolidWorks_Exporter\FlexLM_Export\lmutil.exe",
-                 enable_ad: Optional[bool] = None, ad_server: Optional[str] = None, 
-                 ad_username: Optional[str] = None, ad_password: Optional[str] = None):
+                 mapping_file: str = "mapping.json",
+                 servers: Optional[List[FlexLMServerTarget]] = None,
+                 verbose: bool = False):
+        self.base_dir = _app_base_dir()
+        self.verbose = verbose or os.environ.get("SWX_VERBOSE", "0") == "1"
+
+        # lmutil path abs
+        if not os.path.isabs(lmutil_path):
+            lmutil_path = os.path.join(self.base_dir, lmutil_path)
+        self.lmutil_path = lmutil_path
+
+        # mapping.json finden
+        if not os.path.isabs(mapping_file):
+            candidates = []
+            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                candidates.append(os.path.join(sys._MEIPASS, mapping_file))
+            candidates += [
+                os.path.join(self.base_dir, mapping_file),
+                mapping_file,
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    mapping_file = c
+                    break
+        self.mapping_file = mapping_file
+
         self.license_server = license_server
         self.port = port
-        self.lmutil_path = lmutil_path
-        
-        # AD-Integration automatisch basierend auf Umgebung aktivieren
-        if enable_ad is None:
-            # Automatische Erkennung
-            if AD_INTEGRATION_AVAILABLE:
-                auto_detected = ActiveDirectoryHelper.detect_domain_environment()
-                self.enable_ad = auto_detected
-                if auto_detected:
-                    logger.info("🔍 Domain-Umgebung erkannt - AD-Integration wird automatisch aktiviert")
-                else:
-                    logger.info("🔍 Keine Domain-Umgebung erkannt - AD-Integration bleibt deaktiviert")
-            else:
-                self.enable_ad = False
-                logger.info("ℹ️  AD-Module nicht verfügbar - AD-Integration deaktiviert")
-        else:
-            # Explizit vom Benutzer gesetzt
-            self.enable_ad = enable_ad and AD_INTEGRATION_AVAILABLE
-            if enable_ad and not AD_INTEGRATION_AVAILABLE:
-                logger.warning("⚠️  AD-Integration angefordert, aber Module nicht verfügbar")
-        
-        # Active Directory Helper initialisieren
-        self.ad_helper = None
-        if self.enable_ad:
+        self.location_mapper = None
+        if USERNAME_MAPPING_AVAILABLE:
             try:
-                logger.info("Initialisiere Active Directory Integration...")
-                # Parameter für AD-Helper vorbereiten, falls übergeben
-                ad_kwargs = {}
-                if ad_server:
-                    ad_kwargs['ad_server'] = ad_server
-                if ad_username:
-                    ad_kwargs['username'] = ad_username
-                if ad_password:
-                    ad_kwargs['password'] = ad_password
-                
-                self.ad_helper = ActiveDirectoryHelper(**ad_kwargs)
-                
-                if self.ad_helper.is_enabled():
-                    logger.info("✅ Active Directory Integration aktiviert")
-                else:
-                    logger.info("ℹ️  Active Directory Integration nicht verfügbar (läuft ohne Standort-Features)")
-                    self.enable_ad = False
+                self.location_mapper = UsernameLocationMapper(self.mapping_file)
             except Exception as e:
-                logger.warning(f"⚠️  AD-Initialisierung fehlgeschlagen: {e}")
-                logger.info("ℹ️  Exporter läuft ohne Active Directory Integration")
-                self.enable_ad = False
+                if self.verbose:
+                    logger.warning(f"Mapping init fehlgeschlagen: {e}")
+
+        # Targets Liste
+        if servers and len(servers) > 0:
+            fixed = []
+            for t in servers:
+                lp = t.lmutil_path or self.lmutil_path
+                if not os.path.isabs(lp):
+                    lp = os.path.join(self.base_dir, lp)
+                fixed.append(FlexLMServerTarget(t.host, t.port, lp))
+            self.targets = fixed
         else:
-            logger.info("ℹ️  Active Directory Integration deaktiviert")
-        
-        # Prometheus Metriken definieren
+            self.targets = [FlexLMServerTarget(self.license_server, self.port, self.lmutil_path)]
+
         self.setup_metrics()
-        
-        # Registrierung beim Prometheus Registry
         REGISTRY.register(self)
-        
+        self._last_feature_count = 0
+        self._last_user_count = 0
+
     def setup_metrics(self):
-        """Initialisiert alle Prometheus-Metriken"""
-        
-        # Server Status
-        self.server_up = Gauge(
-            'flexlm_server_up',
-            'FlexLM Server erreichbar (1 = up, 0 = down)',
-            ['server']
-        )
-        
-        # Feature Informationen
-        self.feature_total = Gauge(
-            'flexlm_feature_total_licenses',
-            'Gesamtanzahl der verfügbaren Lizenzen pro Feature',
-            ['server', 'vendor', 'feature']
-        )
-        
-        self.feature_used = Gauge(
-            'flexlm_feature_used_licenses',
-            'Anzahl der verwendeten Lizenzen pro Feature',
-            ['server', 'vendor', 'feature']
-        )
-        
-        self.feature_available = Gauge(
-            'flexlm_feature_available_licenses',
-            'Anzahl der verfügbaren Lizenzen pro Feature',
-            ['server', 'vendor', 'feature']
-        )
-        
-        # Benutzer Informationen (erweitert um Standort)
-        self.user_licenses = Gauge(
-            'flexlm_user_licenses',
-            'Anzahl der von einem Benutzer verwendeten Lizenzen',
-            ['server', 'vendor', 'feature', 'user', 'hostname', 'display', 'location', 'department']
-        )
-        
-        # Standort-spezifische Metriken
-        self.location_licenses = Gauge(
-            'flexlm_location_licenses_total',
-            'Gesamtanzahl der Lizenzen pro Standort',
-            ['server', 'location', 'feature']
-        )
-        
-        self.location_users = Gauge(
-            'flexlm_location_users_total',
-            'Anzahl der Benutzer pro Standort',
-            ['server', 'location']
-        )
-        
-        # Computer/Hostname Informationen
-        self.host_licenses = Gauge(
-            'flexlm_host_licenses_total',
-            'Gesamtanzahl der Lizenzen pro Host',
-            ['server', 'hostname', 'location']
-        )
-        
-        # Daemon Status
-        self.daemon_up = Gauge(
-            'flexlm_daemon_up',
-            'Status der License Daemons (1 = up, 0 = down)',
-            ['server', 'daemon', 'version']
-        )
-        
-        # Scrape Informationen
-        self.scrape_duration = Gauge(
-            'flexlm_scrape_duration_seconds',
-            'Zeit für das Sammeln der Metriken'
-        )
-        
-        self.scrape_errors = Counter(
-            'flexlm_scrape_errors_total',
-            'Anzahl der Fehler beim Sammeln der Metriken'
-        )
+        self.server_up = Gauge('flexlm_server_up', 'Server erreichbar (1/0)', ['server'])
+        self.feature_total = Gauge('flexlm_feature_total_licenses', 'Total Lizenzen', ['server','vendor','feature'])
+        self.feature_used = Gauge('flexlm_feature_used_licenses', 'Verwendete Lizenzen', ['server','vendor','feature'])
+        self.feature_available = Gauge('flexlm_feature_available_licenses', 'Verfügbare Lizenzen', ['server','vendor','feature'])
+        self.user_licenses = Gauge('flexlm_user_licenses', 'Benutzer Lizenz', ['server','vendor','feature','user','hostname','display','location'])
+        self.location_licenses = Gauge('flexlm_location_licenses_total', 'Lizenzen je Standort', ['server','location','feature'])
+        self.location_users = Gauge('flexlm_location_users_total', 'User je Standort', ['server','location'])
+        self.host_licenses = Gauge('flexlm_host_licenses_total', 'Lizenzen je Host', ['server','hostname','location'])
+        self.daemon_up = Gauge('flexlm_daemon_up', 'Daemon Status', ['server','daemon','version'])
+        self.scrape_duration = Gauge('flexlm_scrape_duration_seconds', 'Scrape Dauer')
+        self.scrape_errors = Counter('flexlm_scrape_errors_total', 'Scrape Fehler')
 
-    def run_lmutil_command(self, args: List[str]) -> Tuple[int, str, str]:
-        """
-        Führt lmutil mit einer Liste von Argumenten aus.
-        Gibt (returncode, stdout, stderr) zurück.
-        """
-        cmd = [self.lmutil_path] + args
-        logger.debug(f"Calling lmutil: {cmd!r}")
-
+    def _run_lmstat(self, host: str, port: int, lmutil_path: str) -> Tuple[str,str,int]:
+        cmd = [lmutil_path, 'lmstat', '-c', f'{port}@{host}', '-a']
+        if not os.path.exists(lmutil_path):
+            return '', f'lmutil missing: {lmutil_path}', -99
         try:
-            res = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            logger.debug(f"lmutil returncode={res.returncode}")
-            logger.debug(f"lmutil stdout:\n{res.stdout}")
-            logger.debug(f"lmutil stderr:\n{res.stderr}")
-            return res.returncode, res.stdout, res.stderr
-
-        except subprocess.TimeoutExpired as e:
-            logger.error(f"lmutil timeout: {e}")
-            return -1, "", "TimeoutExpired"
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+            return proc.stdout or '', proc.stderr or '', proc.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'timeout', -2
         except Exception as e:
-            logger.error(f"lmutil exception: {e}")
-            return -1, "", str(e)
-        
+            return '', str(e), -1
 
     def parse_lmstat_output(self, output: str) -> Dict:
-        """Parsed die Ausgabe von lmstat -a"""
-        data = {
-            'server_status': False,
-            'daemons': [],
-            'features': [],
-            'users': []
-        }
-        
-        lines = output.split('\n')
+        data = {'server_status': False, 'daemons': [], 'features': [], 'users': []}
+        lines = output.splitlines()
         current_feature = None
         in_users_section = False
-        
-        for line in lines:
-            original_line = line
-            line = line.strip()
-            
-            # Server Status prüfen
+        feature_hdr_re = re.compile(r'^Users of\s+([\w\-\.\+]+):\s+\(Total of\s+(\d+)\s+licenses?.*Total of\s+(\d+)\s+licenses? in use\)', re.IGNORECASE)
+        feature_hdr_alt = re.compile(r'^Users of\s+([\w\-\.\+]+):\s+\(Total of\s+(\d+)\s+licenses?,\s+(\d+)\s+in use\)', re.IGNORECASE)
+        daemon_re = re.compile(r'(\w+): UP v([0-9.]+)')
+        user_line_re = re.compile(r'^\s*(\S+)\s+(\S+)\s+(\S+)\s+\([^)]+\)\s+\([^)]+\s+\d+\)', re.IGNORECASE)
+        user_line_generic = re.compile(r'^\s*(\S+?)(?:@|\s+)([A-Za-z0-9_\-.]+)\s+\(v[0-9\.]+\)\s+\([^)]+\s+\d+\)', re.IGNORECASE)
+        for raw in lines:
+            line = raw.strip()
             if 'license server UP' in line:
                 data['server_status'] = True
-            elif 'Cannot connect to license server' in line:
-                data['server_status'] = False
-            
-            # Daemon Status
-            daemon_match = re.search(r'(\w+): UP v([0-9.]+)', line)
-            if daemon_match:
-                daemon_name = daemon_match.group(1)
-                version = daemon_match.group(2)
-                data['daemons'].append({
-                    'name': daemon_name,
-                    'status': 'UP',
-                    'version': version
-                })
-            
-            # Feature Informationen
-            feature_match = re.search(r'Users of (\w+):\s+\(Total of (\d+) license[s]? issued;\s+Total of (\d+) license[s]? in use\)', line)
-            if feature_match:
-                feature_name = feature_match.group(1)
-                total_licenses = int(feature_match.group(2))
-                used_licenses = int(feature_match.group(3))
-                
+            dm = daemon_re.search(line)
+            if dm:
+                data['daemons'].append({'name': dm.group(1), 'status': 'UP', 'version': dm.group(2)})
+            fm = feature_hdr_re.search(raw) or feature_hdr_alt.search(raw)
+            if fm:
                 current_feature = {
-                    'name': feature_name,
-                    'total': total_licenses,
-                    'used': used_licenses,
-                    'available': total_licenses - used_licenses,
+                    'name': fm.group(1),
+                    'total': int(fm.group(2)),
+                    'used': int(fm.group(3)),
+                    'available': int(fm.group(2)) - int(fm.group(3)),
                     'users': []
                 }
                 data['features'].append(current_feature)
                 in_users_section = True
                 continue
-            
-            # Neues Feature beginnt - beende aktuellen Benutzer-Bereich
-            if line.startswith('Users of ') and current_feature:
+            if line.startswith('Users of ') and not (feature_hdr_re.search(raw) or feature_hdr_alt.search(raw)):
                 in_users_section = False
                 current_feature = None
-            
-            # Benutzer Informationen (erweitert für Computer-Namen)
             if in_users_section and current_feature:
-                # Pattern für Benutzer-Zeilen: "    username hostname display (v2022.1105) (license_server/27000 1234), start ..."
-                user_match = re.search(r'^\s+(\S+)\s+(\S+)\s+(\S+)\s+\([^)]+\)\s+\([^)]+\s+\d+\)', original_line)
-                if user_match:
-                    username = user_match.group(1)
-                    hostname = user_match.group(2)
-                    display = user_match.group(3)
-                    
-                    user_info = {
-                        'username': username,
-                        'hostname': hostname,
-                        'display': display,
-                        'feature': current_feature['name']
-                    }
-                    
-                    current_feature['users'].append(user_info)
-                    data['users'].append(user_info)
-                    continue
-        
+                um = user_line_re.search(raw) or user_line_generic.search(raw)
+                if um:
+                    username = um.group(1)
+                    hostname = um.group(2)
+                    display = um.group(3) if um.lastindex and um.lastindex >= 3 else username
+                    current_feature['users'].append({'username': username,'hostname': hostname,'display': display,'feature': current_feature['name']})
+                    data['users'].append({'username': username,'hostname': hostname,'display': display,'feature': current_feature['name']})
         return data
 
-    def collect_metrics(self):
-        """Sammelt alle Metriken vom FlexLM Server"""
-        start_time = time.time()
-        
-        try:
-            # lmstat -a ausführen für detaillierte Informationen
-            rc, output, error = self.run_lmutil_command([
-                "lmstat", "-a", "-c", f"{self.port}@{self.license_server}"
-            ])
-
-            # 2) Fehler-Metrik setzen
-            if rc != 0:
-                self.server_up.labels(server=f"{self.license_server}:{self.port}").set(0)
-                self.scrape_errors.inc()
-                logger.error("lmutil fehlerhaft, rc=%d, err=%s", rc, error)
-                return
-
-            # 3) Ausgabe verarbeiten
-            self.server_up.labels(server=f"{self.license_server}:{self.port}").set(1)
-            data = self.parse_lmstat_output(output)
-
-            server_label = f"{self.license_server}:{self.port}"
-            self.server_up.labels(server=server_label).set(1 if data['server_status'] else 0)
-            
-            # Daemon Status
-            for daemon in data['daemons']:
-                self.daemon_up.labels(
-                    server=server_label,
-                    daemon=daemon['name'],
-                    version=daemon['version']
-                ).set(1 if daemon['status'] == 'UP' else 0)
-            
-            # Feature Metriken
-            for feature in data['features']:
-                vendor = 'solidworks'  # Annahme für SolidWorks
-                
-                self.feature_total.labels(
-                    server=server_label,
-                    vendor=vendor,
-                    feature=feature['name']
-                ).set(feature['total'])
-                
-                self.feature_used.labels(
-                    server=server_label,
-                    vendor=vendor,
-                    feature=feature['name']
-                ).set(feature['used'])
-                
-                self.feature_available.labels(
-                    server=server_label,
-                    vendor=vendor,
-                    feature=feature['name']
-                ).set(feature['available'])
-                
-                # Benutzer-spezifische Metriken (erweitert um AD-Informationen)
-                location_counts = {}  # Zähler für Standorte
-                
-                for user in feature['users']:
-                    # Standort-Informationen aus AD abrufen
-                    location = "Unknown"
-                    department = "Unknown"
-                    
-                    if self.enable_ad and self.ad_helper:
-                        try:
-                            user_info = self.ad_helper.get_user_info(user['username'])
-                            location = user_info.location if user_info.location else "Unknown"
-                            department = user_info.department if user_info.department else "Unknown"
-                            logger.debug(f"AD Info für {user['username']}: {location}, {department}")
-                        except Exception as e:
-                            logger.warning(f"AD-Abfrage für {user['username']} fehlgeschlagen: {e}")
-                    
-                    # Benutzer-Metrik mit Standort
-                    self.user_licenses.labels(
-                        server=server_label,
-                        vendor=vendor,
-                        feature=feature['name'],
-                        user=user['username'],
-                        hostname=user['hostname'],
-                        display=user['display'],
-                        location=location,
-                        department=department
-                    ).set(1)  # 1 Lizenz pro Benutzer/Feature Kombination
-                    
-                    # Standort-Zähler aktualisieren
-                    location_key = f"{location}_{feature['name']}"
-                    if location_key in location_counts:
-                        location_counts[location_key] += 1
-                    else:
-                        location_counts[location_key] = 1
-                
-                # Standort-basierte Metriken setzen
-                for location_key, count in location_counts.items():
-                    location, feature_name = location_key.rsplit('_', 1)
-                    self.location_licenses.labels(
-                        server=server_label,
-                        location=location,
-                        feature=feature_name
-                    ).set(count)
-            
-            # Host-basierte Metriken (Computer-Namen aggregieren) - erweitert um Standort
-            host_counts = {}
-            location_user_counts = {}
-            
-            for user in data['users']:
-                hostname = user['hostname']
-                
-                # Standort für Host ermitteln
-                location = "Unknown"
-                if self.enable_ad and self.ad_helper:
+    def collect_metrics_for_target(self, target: FlexLMServerTarget):
+        stdout, stderr, rc = self._run_lmstat(target.host, target.port, target.lmutil_path)
+        server_label = f"{target.host}:{target.port}"
+        if rc != 0 or not stdout.strip():
+            self.server_up.labels(server=server_label).set(0)
+            self.scrape_errors.inc()
+            if self.verbose:
+                print(f"DEBUG {server_label} rc={rc} stderr={stderr.strip()} lmutil={target.lmutil_path} exists={os.path.exists(target.lmutil_path)}")
+            return 0, 0
+        data = self.parse_lmstat_output(stdout)
+        self.server_up.labels(server=server_label).set(1 if data['server_status'] else 0)
+        vendor = 'solidworks'
+        for d in data['daemons']:
+            self.daemon_up.labels(server=server_label, daemon=d['name'], version=d['version']).set(1 if d['status']=='UP' else 0)
+        for feature in data['features']:
+            self.feature_total.labels(server=server_label, vendor=vendor, feature=feature['name']).set(feature['total'])
+            self.feature_used.labels(server=server_label, vendor=vendor, feature=feature['name']).set(feature['used'])
+            self.feature_available.labels(server=server_label, vendor=vendor, feature=feature['name']).set(feature['available'])
+            loc_counts: Dict[Tuple[str,str], int] = {}
+            for u in feature['users']:
+                location = 'Unknown'
+                if self.location_mapper:
                     try:
-                        user_info = self.ad_helper.get_user_info(user['username'])
-                        location = user_info.location if user_info.location else "Unknown"
+                        location = self.location_mapper.get_user_location_info(u['username']).location
                     except Exception:
                         pass
-                
-                # Host-Zähler
-                host_key = f"{hostname}_{location}"
-                if host_key in host_counts:
-                    host_counts[host_key] += 1
-                else:
-                    host_counts[host_key] = 1
-                
-                # Benutzer pro Standort zählen
-                if location in location_user_counts:
-                    location_user_counts[location].add(user['username'])
-                else:
-                    location_user_counts[location] = {user['username']}
-            
-            # Host-Metriken setzen
-            for host_key, count in host_counts.items():
-                hostname, location = host_key.rsplit('_', 1)
-                self.host_licenses.labels(
-                    server=server_label,
-                    hostname=hostname,
-                    location=location
-                ).set(count)
-            
-            # Benutzer pro Standort Metriken
-            for location, users in location_user_counts.items():
-                self.location_users.labels(
-                    server=server_label,
-                    location=location
-                ).set(len(users))
-            
-            logger.info(f"Metriken erfolgreich gesammelt. Features: {len(data['features'])}, Users: {len(data['users'])}")
-            
-        except Exception as e:
-            logger.error(f"Fehler beim Sammeln der Metriken: {e}")
-            self.scrape_errors.inc()
-        
-        finally:
-            # Scrape-Dauer aufzeichnen
-            duration = time.time() - start_time
-            self.scrape_duration.set(duration)
+                self.user_licenses.labels(server=server_label, vendor=vendor, feature=feature['name'], user=u['username'], hostname=u['hostname'], display=u['display'], location=location).set(1)
+                loc_counts[(location, feature['name'])] = loc_counts.get((location, feature['name']), 0) + 1
+            for (loc, feat), cnt in loc_counts.items():
+                self.location_licenses.labels(server=server_label, location=loc, feature=feat).set(cnt)
+        host_counts: Dict[Tuple[str,str], int] = {}
+        loc_user_sets: Dict[str, set] = {}
+        for u in data['users']:
+            location = 'Unknown'
+            if self.location_mapper:
+                try:
+                    location = self.location_mapper.get_user_location_info(u['username']).location
+                except Exception:
+                    pass
+            hk = (u['hostname'], location)
+            host_counts[hk] = host_counts.get(hk, 0) + 1
+            loc_user_sets.setdefault(location, set()).add(u['username'])
+        for (hn, loc), cnt in host_counts.items():
+            self.host_licenses.labels(server=server_label, hostname=hn, location=loc).set(cnt)
+        for loc, users in loc_user_sets.items():
+            self.location_users.labels(server=server_label, location=loc).set(len(users))
+        return len(data['features']), len(data['users'])
+
+    def collect_metrics(self):
+        start = time.time()
+        feats = 0; users = 0
+        for t in self.targets:
+            f,u = self.collect_metrics_for_target(t)
+            feats += f; users += u
+        self.scrape_duration.set(time.time() - start)
+        self._last_feature_count = feats
+        self._last_user_count = users
 
     def collect(self):
-        """Prometheus Collector Interface"""
         self.collect_metrics()
         return []
 
     def start_server(self, port: int = 9090):
-        """Startet den HTTP Server für Prometheus Metriken"""
-        logger.info(f"Starte FlexLM Exporter auf Port {port}")
-        logger.info(f"Metriken verfügbar unter: http://localhost:{port}/metrics")
-        logger.info(f"Überwachung von FlexLM Server: {self.license_server}:{self.port}")
-        
         start_http_server(port)
-        
-        # Initiale Metriken sammeln
         self.collect_metrics()
-        
-        # Kontinuierliche Aktualisierung in separatem Thread
-        def update_metrics():
+        if len(self.targets) == 1:
+            t = self.targets[0]
+            print(f"Exporter läuft | Server {t.host}:{t.port} | Port {port} | Features {self._last_feature_count} | Users {self._last_user_count}")
+        else:
+            servers = ','.join([f"{t.host}:{t.port}" for t in self.targets])
+            print(f"Exporter läuft | {len(self.targets)} Server ({servers}) | Port {port} | Features {self._last_feature_count} | Users {self._last_user_count}")
+        logging.getLogger().setLevel(logging.ERROR)
+        def loop():
             while True:
-                time.sleep(30)  # Alle 30 Sekunden aktualisieren
+                time.sleep(30)
                 self.collect_metrics()
-        
-        update_thread = threading.Thread(target=update_metrics, daemon=True)
-        update_thread.start()
-        
-        logger.info("FlexLM Exporter gestartet. Drücken Sie Ctrl+C zum Beenden.")
-        
+        threading.Thread(target=loop, daemon=True).start()
         try:
-            while True:
-                time.sleep(1)
+            while True: time.sleep(3600)
         except KeyboardInterrupt:
-            logger.info("FlexLM Exporter beendet.")
+            pass
 
+def load_servers_yaml(path: str) -> List[FlexLMServerTarget]:
+    if not YAML_AVAILABLE:
+        return []
+    try:
+        base_dir = _app_base_dir()
+        # YAML lokalisieren
+        if not os.path.isabs(path):
+            candidates = []
+            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                candidates.append(os.path.join(sys._MEIPASS, path))
+            candidates += [os.path.join(base_dir, path), path]
+            for c in candidates:
+                if os.path.exists(c):
+                    path = c; break
+        with open(path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+        servers_section = data.get('servers', []) if isinstance(data, dict) else []
+        targets: List[FlexLMServerTarget] = []
+        for entry in servers_section:
+            if not isinstance(entry, dict):
+                continue
+            host = entry.get('host')
+            port = entry.get('port') or entry.get('license_port')
+            lmutil_path = entry.get('lmutil_path') or 'lmutil.exe'
+            if not host or not port:
+                continue
+            try:
+                port = int(port)
+            except Exception:
+                continue
+            if not os.path.isabs(lmutil_path):
+                lmutil_candidates = []
+                if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                    lmutil_candidates.append(os.path.join(sys._MEIPASS, 'lmutil.exe'))
+                lmutil_candidates += [
+                    os.path.join(base_dir, lmutil_path),
+                    os.path.join(base_dir, 'lmutil.exe'),
+                    lmutil_path
+                ]
+                for c in lmutil_candidates:
+                    if os.path.exists(c):
+                        lmutil_path = c; break
+            targets.append(FlexLMServerTarget(host=host, port=port, lmutil_path=lmutil_path))
+        return targets
+    except Exception:
+        return []
 
 def main():
-    """Hauptfunktion"""
     import argparse
-    
-    parser = argparse.ArgumentParser(description='FlexLM License Server Exporter für Prometheus mit Active Directory Integration')
-    parser.add_argument('--license-server', default='lic-solidworks-emea.patec.group', 
-                       help='FlexLM License Server Hostname/IP (default: lic-solidworks-emea.patec.group)')
-    parser.add_argument('--license-port', type=int, default=25734,
-                       help='FlexLM License Server Port (default: 25734)')
-    parser.add_argument('--exporter-port', type=int, default=9090,
-                       help='Port für den Prometheus Exporter (default: 9090)')
-    parser.add_argument('--lmutil-path', default=r'C:\Temp\SolidWorks_Exporter\FlexLM_Export\lmutil.exe',
-                       help='Pfad zur lmutil Binary (default: C:\\Temp\\SolidWorks_Exporter\\FlexLM_Export\\lmutil.exe)')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                       help='Verbose Logging aktivieren')
-    
-    # Active Directory Parameter
-    parser.add_argument('--enable-ad', action='store_true',
-                       help='Active Directory Integration explizit aktivieren')
-    parser.add_argument('--disable-ad', action='store_true',
-                       help='Active Directory Integration explizit deaktivieren')
-    parser.add_argument('--ad-server', type=str,
-                       help='Active Directory Server (optional, wird automatisch ermittelt)')
-    parser.add_argument('--ad-username', type=str,
-                       help='AD Benutzername für explizite Anmeldung (optional)')
-    parser.add_argument('--ad-password', type=str,
-                       help='AD Passwort für explizite Anmeldung (optional)')
-    
-    args = parser.parse_args()
-    
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    # AD-Aktivierung bestimmen
-    enable_ad = None  # Automatische Erkennung
-    if args.enable_ad:
-        enable_ad = True
-    elif args.disable_ad:
-        enable_ad = False
-    # Sonst bleibt enable_ad = None für automatische Erkennung
-    
-    # Exporter erstellen und starten
+    p = argparse.ArgumentParser(description='FlexLM Exporter (SolidWorks)')
+    p.add_argument('--license-server', default='lic-solidworks-emea.patec.group')
+    p.add_argument('--license-port', type=int, default=25734)
+    p.add_argument('--exporter-port', type=int, default=9090)
+    p.add_argument('--lmutil-path', default=r'C:\Temp\SolidWorks_Exporter\FlexLM_Export\lmutil.exe')
+    p.add_argument('--mapping-file', default='mapping.json')
+    p.add_argument('--servers-yaml')
+    p.add_argument('--verbose','-v', action='store_true')
+    args = p.parse_args()
+    servers: List[FlexLMServerTarget] = []
+    if args.servers_yaml:
+        servers = load_servers_yaml(args.servers_yaml)
     exporter = FlexLMExporter(
         license_server=args.license_server,
         port=args.license_port,
         lmutil_path=args.lmutil_path,
-        enable_ad=enable_ad,
-        ad_server=args.ad_server,
-        ad_username=args.ad_username,
-        ad_password=args.ad_password
+        mapping_file=args.mapping_file,
+        servers=servers,
+        verbose=args.verbose
     )
-    
     exporter.start_server(args.exporter_port)
-
 
 if __name__ == '__main__':
     main()
