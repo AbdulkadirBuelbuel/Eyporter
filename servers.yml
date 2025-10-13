@@ -10,19 +10,26 @@ servers:
   #   port: 25734
   # - host: lic-solidworks-amas.patec.group
   #   port: 25734
-  - host: lic-ansys.patec.group
-    port: 1084
-  - host: lic-eplan-emea.patec.group
-    port: 5000
-  - host: lic-mechworks-emea.patec.group
-    port: 11000
+  # - host: lic-ansys.patec.group
+  #   port: 1084
+  # - host: lic-eplan-emea.patec.group
+  #   port: 5000
+  # - host: lic-mechworks-emea.patec.group
+  #   port: 11000
   - host: lic-matlab.patec.group
     port: 27010
-  - host: lic-mathcad.patec.group
-    port: 7788
-  - host: lic-cornerstone-emea.patec.group
-    port: 27002    
-  - host: lic-ruplan-emea.patec.group
-    port: 6500
-  - host: lic-powertools.patec.group
-    port: 1798  
+  # - host: lic-mathcad.patec.group
+  #   port: 7788
+  # - host: lic-cornerstone-emea.patec.group
+  #   port: 27002    
+  # - host: lic-ruplan-emea.patec.group
+  #   port: 6500
+  # - host: lic-powertools.patec.group
+  #   port: 1799
+  # - host: lic-mechworks-amas.patec.group
+  #   port: 27000
+  # - host: bngecadlm.patec.group
+  #   port: 27001
+  # - host: WEEVMP006
+  #   port: 27000
+
