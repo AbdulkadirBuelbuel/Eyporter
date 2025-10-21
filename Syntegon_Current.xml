@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+
+<logfile name="Report_current" extension="txt" path="C:\Eplan" date="%d.%B %Y" time="%H:%M:%S" separator="TAB" sortorigin="true">
+
+<head>
+ <text>Syntegon Technology GmbH</text>
+ <text>EPLAN License Manager Version %ELM_VERSION</text>
+ <text>License serial number: %ELM_LICENSESERIALNUMBER Dongle: %ELM_DONGLESERIALNUMBER Valid until: %ELM_LICENSEENDDATE</text>
+ <linespacing>1</linespacing>
+ <text>%CREATORNAME %DATE %TIME</text>
+ </head>
+ 
+  <summary value="current">
+ <linespacing>2</linespacing>
+ <text>Summary of license using</text>
+ <datetime header="Time" value="all" format="%d.%m.%y %H:%M:%S" />
+ <totalissued header="Total Issued" value="all" />
+ <totalinuse header="Total license in use" value="all" />
+ <totalborrowissued header="Total borrow issued" value="all" />
+ <totalborrowed header="Total borrowed" value="all" />
+ <totalfree header="Total free" value="all" />
+ <bundle header="Bundle" value="all" />
+ <module header="Module" value="all" />
+ </summary>
+ 
+</logfile>

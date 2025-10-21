@@ -1,0 +1,205 @@
+# --- Settings ---
+$eplanLic_path       = "C:\Eplan"
+$report_txt          = "$eplanLic_path\Report_current.txt" 
+$port                = 9094
+$scanSeconds         = 30
+
+# --- State ---
+$global:eplanMetrics = @{}
+$global:listener     = $null
+
+# function New-Report {
+#     $args = "/Createreport /Servername:$serverName /Xmlfile:$syntegon_current_xml /Timezone:CET /Lasthours:1 /Lang:1031 /Silent"
+#     Start-Process -FilePath $elmMonitor -ArgumentList $args -Wait  # erzeugt Report_current.txt lt. XML
+# }
+
+function Read-Report {
+    $global:eplanMetrics.Clear()
+
+    if (!(Test-Path $report_txt)) { return }
+
+    $start = $false
+    # CEplan liest TAB-getrennt nach dem Header "Time" – wir machen das ebenso, nur kompakt. :contentReference[oaicite:4]{index=4}
+    Get-Content -Path $report_txt -Encoding Unicode | ForEach-Object {
+        if ($start) {
+            $c = $_ -split "`t"
+            if ($c.Count -ge 8) {
+                $total   = [int]$c[1]
+                $inuse   = [int]$c[2]
+                $bundle  = ($c[6]).Trim()
+                $module  = ($c[7]).Trim()
+                $key     = "$bundle|$module"
+                $global:eplanMetrics[$key] = @{ total = $total; in_use = $inuse; bundle = $bundle; module = $module }
+            }
+        } elseif ($_ -like "Time*") {
+            $start = $true
+        }
+    }
+}
+
+function eplan_lic_prometheus_update {
+    param (
+        [String]$measurement, 
+        [String]$bundle, 
+        [String]$module, 
+        [String]$total_issued, 
+        [String]$total_license_in_use
+    )
+    
+    $bundle_clean = ($bundle -replace '"', '\"' -replace '\\', '\\' -replace '\n', ' ' -replace '\r', '').Trim()
+    $module_clean = ($module -replace '"', '\"' -replace '\\', '\\' -replace '\n', ' ' -replace '\r', '').Trim()
+    
+    if ([string]::IsNullOrWhiteSpace($bundle_clean)) { $bundle_clean = "unknown" }
+    if ([string]::IsNullOrWhiteSpace($module_clean)) { $module_clean = "unknown" }
+    
+    try { $total = [int]$total_issued } catch { $total = 0 }
+    try { $in_use = [int]$total_license_in_use } catch { $in_use = 0 }
+    
+    $key = "$bundle_clean|$module_clean"
+    
+    $global:eplan_metrics[$key] = @{
+        bundle = $bundle_clean
+        module = $module_clean
+        total = $total
+        in_use = $in_use
+        timestamp = Get-Date
+    }
+}
+
+function eplan_lic_db_update {
+    param (
+        [String]$measurement, 
+        [String]$bundle, 
+        [String]$module, 
+        [String]$total_issued, 
+        [String]$total_license_in_use
+    )
+    
+    eplan_lic_prometheus_update -measurement $measurement -bundle $bundle -module $module -total_issued $total_issued -total_license_in_use $total_license_in_use
+}
+
+# TCP-Server (benÃ¶tigt keine Admin-Rechte)
+function Start-TCPServer {
+    param([int]$Port = 9094)
+    
+    try {
+        $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, $Port)
+        $global:tcp_listener = New-Object System.Net.Sockets.TcpListener($endpoint)
+        $global:tcp_listener.Start()
+        Write-Host "EPLAN Prometheus Exporter gestartet auf Port $Port"
+        Write-Host "Metrics verfÃ¼gbar unter: http://localhost:$Port/metrics"
+        return $true
+    } catch {
+        Write-Host "FEHLER beim Starten des TCP-Servers: $_"
+        return $false
+    }
+}
+
+function Handle-TCPRequests {
+    if ($global:tcp_listener -and $global:tcp_listener.Pending()) {
+        try {
+            $client = $global:tcp_listener.AcceptTcpClient()
+            $stream = $client.GetStream()
+            $reader = New-Object System.IO.StreamReader($stream)
+            $writer = New-Object System.IO.StreamWriter($stream)
+            
+            # HTTP Request Header lesen
+            $request_line = $reader.ReadLine()
+            
+            # Weitere Header Ã¼berspringen bis zur leeren Zeile
+            do {
+                $header = $reader.ReadLine()
+            } while ($header -ne "")
+            
+            # Metrics generieren
+            $metrics_content = "# HELP eplan_licenses_total Total number of EPLAN licenses`n"
+            $metrics_content += "# TYPE eplan_licenses_total gauge`n"
+            $metrics_content += "# HELP eplan_licenses_in_use Number of EPLAN licenses currently in use`n"
+            $metrics_content += "# TYPE eplan_licenses_in_use gauge`n"
+            
+            if ($global:eplan_metrics.Count -eq 0) {
+                $metrics_content += "eplan_licenses_total{bundle=`"no_data`",module=`"no_data`"} 0`n"
+                $metrics_content += "eplan_licenses_in_use{bundle=`"no_data`",module=`"no_data`"} 0`n"
+            } else {
+                foreach ($key in $global:eplan_metrics.Keys) {
+                    $metric = $global:eplan_metrics[$key]
+                    $metrics_content += "eplan_licenses_total{bundle=`"$($metric.bundle)`",module=`"$($metric.module)`"} $($metric.total)`n"
+                    $metrics_content += "eplan_licenses_in_use{bundle=`"$($metric.bundle)`",module=`"$($metric.module)`"} $($metric.in_use)`n"
+                }
+            }
+            
+            # HTTP Response senden
+            if ($request_line -match "GET /metrics") {
+                $writer.WriteLine("HTTP/1.1 200 OK")
+                $writer.WriteLine("Content-Type: text/plain; charset=utf-8")
+                $writer.WriteLine("Content-Length: $($metrics_content.Length)")
+                $writer.WriteLine("Connection: close")
+                $writer.WriteLine()
+                $writer.Write($metrics_content)
+            } else {
+                $error_msg = "404 - Use /metrics endpoint"
+                $writer.WriteLine("HTTP/1.1 404 Not Found")
+                $writer.WriteLine("Content-Type: text/plain")
+                $writer.WriteLine("Content-Length: $($error_msg.Length)")
+                $writer.WriteLine("Connection: close")
+                $writer.WriteLine()
+                $writer.Write($error_msg)
+            }
+            
+            $writer.Flush()
+            $stream.Close()
+            $client.Close()
+        } catch {
+            # Stille Behandlung von Verbindungsfehlern
+        }
+    }
+}
+
+
+
+#-----------------------------------------------------
+# TCP-Server starten
+if (!(Start-TCPServer -Port 9094)) {
+    Write-Host "WARNUNG: Server konnte nicht gestartet werden. Script lÃ¤uft ohne Web-Interface."
+    exit 1
+}
+
+# Initial Dummy-Metriken setzen
+$global:eplan_metrics["initial|no_data"] = @{
+    bundle = "no_data"
+    module = "no_data"
+    total = 0
+    in_use = 0
+    timestamp = Get-Date
+}
+
+try {
+    $last_report_time = Get-Date
+    
+    while ($true) {
+        # TCP-Requests verarbeiten (non-blocking)
+        Handle-TCPRequests
+        
+        # Report alle 30 Sekunden erstellen (unabhÃ¤ngig von Dateien)
+        $current_time = Get-Date
+        if (($current_time - $last_report_time).TotalSeconds -ge 30) {
+            Write-Host "Starte Report-Erstellung..."
+            $script_start = Get-Date
+            
+            create-license-report
+            Read-Report
+            
+            $last_report_time = Get-Date
+            $elapsed = (Get-Date) - $script_start
+            Write-Host "Report-Zyklus abgeschlossen in $([math]::Round($elapsed.TotalSeconds, 2)) Sekunden"
+        }
+        
+        # Kurze Pause zwischen Checks
+        Start-Sleep -Milliseconds 500
+    }
+} finally {
+    if ($global:tcp_listener) {
+        $global:tcp_listener.Stop()
+    }
+    Write-Host "EPLAN License Monitor beendet"
+}
