@@ -23,39 +23,45 @@ logger = logging.getLogger(__name__)
 class ADLocationLookup:
     """AD City Lookup mit Hintergrund-Thread und Cache, blockiert Scrapes nicht."""
     def __init__(self, domain: str = 'patec.group', cache_file: str = 'ad_cache.json', 
-                 failed_retry_hours: int = 0.1, cache_ttl_hours: int = 0.2):  # 168h = 1 Woche
+                 failed_retry_hours: int = 0.2):  # Nur noch Failed-User TTL
         self.domain = domain
         self.cache_file = cache_file
         self.failed_retry_seconds = failed_retry_hours * 3600 
-        self.cache_ttl_seconds = cache_ttl_hours * 3600  # NEU: Cache TTL
-        self._cache: Dict[str, Tuple[str, float]] = {}  # NEU: (location, timestamp)
-        self._failed_users: Dict[str, float] = {} 
+        self._cache: Dict[str, str] = {}  # ZURÜCK zu einfachem Dict ohne Zeitstempel
+        self._failed_users: Dict[str, float] = {}  # Nur Failed Users behalten Zeitstempel
         self._lock = threading.Lock()
         self._queue: "queue.Queue[str]" = queue.Queue(maxsize=2000)
         self._stop_event = threading.Event()
         self._load_cache()
-        self._worker = threading.Thread(target=self._worker_loop, name="ADLocationWorker", daemon=True)
-        self._worker.start()
+
+        self._workers = []
+        for i in range(3): 
+            worker = threading.Thread(target=self._worker_loop, name=f"ADWorker-{i}", daemon=True)
+            worker.start()
+            self._workers.append(worker)
+        
+        logger.info(f"AD Location Lookup mit {len(self._workers)} Worker-Threads gestartet")
 
     def stop(self):
         """Optional beim Shutdown aufrufen."""
         logger.info("AD Lookup wird beendet...")
         self._stop_event.set()
         
-        # Alle wartenden Queue-Gets unterbrechen
-        try:
-            self._queue.put_nowait("__STOP__")
-        except queue.Full:
-            pass
+        # Alle Worker stoppen
+        for _ in range(len(self._workers)):
+            try:
+                self._queue.put_nowait("__STOP__")
+            except queue.Full:
+                pass
         
-        # Worker mit längerem Timeout beenden
-        if self._worker.is_alive():
-            logger.info("Warte auf Worker-Thread...")
-            self._worker.join(timeout=5)
-            if self._worker.is_alive():
-                logger.warning("Worker-Thread antwortet nicht, fahre trotzdem fort")
+        # Auf alle Worker warten
+        for i, worker in enumerate(self._workers):
+            if worker.is_alive():
+                logger.info(f"Warte auf Worker-{i}...")
+                worker.join(timeout=2)
+                if worker.is_alive():
+                    logger.warning(f"Worker-{i} antwortet nicht")
         
-        # Cache speichern
         try:
             self._save_cache()
             logger.info("Cache gespeichert")
@@ -70,19 +76,19 @@ class ADLocationLookup:
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     
-                    # Cache mit Zeitstempel laden
+                    # Cache laden (einfache String-Werte)
                     cache_data = data.get('cache', {})
-                    if cache_data and isinstance(list(cache_data.values())[0], str):
-                        # Alte Version: nur Strings -> alle auf jetzt setzen
-                        now = time.time()
-                        self._cache = {k: (v, now) for k, v in cache_data.items()}
-                        logger.info(f"Cache konvertiert: {len(self._cache)} User (alte Version)")
-                    else:
-                        # Neue Version: bereits (location, timestamp) Tupel
-                        self._cache = {k: tuple(v) for k, v in cache_data.items()}
-                        logger.info(f"Cache geladen: {len(self._cache)} User (mit TTL)")
+                    if cache_data:
+                        # Wenn es Tupel sind (alte Version), nur den Location-Teil nehmen
+                        if isinstance(list(cache_data.values())[0], list):
+                            self._cache = {k: v[0] for k, v in cache_data.items()}
+                            logger.info(f"Cache konvertiert: {len(self._cache)} User (Tupel -> String)")
+                        else:
+                            # Bereits einfache Strings
+                            self._cache = cache_data
+                            logger.info(f"Cache geladen: {len(self._cache)} User")
                     
-                    # Failed users laden
+                    # Failed users laden (mit Zeitstempel)
                     failed_data = data.get('failed_users', [])
                     if isinstance(failed_data, list):
                         now = time.time()
@@ -97,11 +103,9 @@ class ADLocationLookup:
         """Cache in Datei speichern"""
         try:
             with self._lock:
-                # Cache als (location, timestamp) Tupel speichern
-                cache_for_json = {k: list(v) for k, v in self._cache.items()}
                 data = {
-                    'cache': cache_for_json,
-                    'failed_users': dict(self._failed_users),
+                    'cache': dict(self._cache),  # Einfache String-Werte
+                    'failed_users': dict(self._failed_users),  # Failed Users mit Zeitstempel
                     'timestamp': time.time()
                 }
             
@@ -113,10 +117,10 @@ class ADLocationLookup:
 
     def get_location(self, username: str) -> str:
         """
-        Nicht-blockierender Lookup mit Cache TTL:
-        - Gibt sofort aus Cache zurück, wenn vorhanden UND nicht abgelaufen
-        - Prüft Failed Users und gibt sie nach TTL wieder frei
-        - Sonst 'Unknown' und stößt AD-Abfrage im Hintergrund an
+        Nicht-blockierender Lookup OHNE Cache-TTL:
+        - Cache wird NIE geleert (permanent)
+        - Nur Failed Users haben TTL und werden nach Zeit wieder versucht
+        - Neue User werden im Hintergrund abgefragt
         """
         username_clean = username.split("\\")[-1].split("@")[0]
         username_lower = username_clean.lower().strip()
@@ -126,19 +130,9 @@ class ADLocationLookup:
         now = time.time()
 
         with self._lock:
-            # 1. Cache-Hit: Prüfe TTL
+            # 1. Cache-Hit: Sofort zurückgeben (PERMANENT)
             if username_lower in self._cache:
-                location, cached_time = self._cache[username_lower]
-                age_hours = (now - cached_time) / 3600
-                
-                if now - cached_time <= self.cache_ttl_seconds:
-                    # Noch frisch
-                    return location
-                else:
-                    # TTL abgelaufen -> aus Cache entfernen für neue Abfrage
-                    logger.debug(f"Cache TTL abgelaufen für '{username_lower}' (Alter: {age_hours:.1f}h)")
-                    del self._cache[username_lower]
-                    # Weiter zur Queue...
+                return self._cache[username_lower]
             
             # 2. Failed User Check mit TTL
             if username_lower in self._failed_users:
@@ -159,6 +153,17 @@ class ADLocationLookup:
 
         return "Unknown"
      
+    # def _save_cache_async(self):
+    #     """Asynchrone Cache-Speicherung nach Cache-Clearing"""
+    #     try:
+    #         self._save_cache()
+    #         logger.info("Cache nach Clearing gespeichert")
+    #     except Exception as e:
+    #         logger.error(f"Fehler beim Cache-Speichern nach Clearing: {e}")
+
+
+           
+
 
     def _worker_loop(self):
         """Hintergrundthread, der User aus der Queue abarbeitet und Cache füllt."""
@@ -174,14 +179,14 @@ class ADLocationLookup:
                     logger.info("AD Worker: Stop Signal erhalten")
                     break
 
-                # Nochmal checken, ob inzwischen gecached oder in failed (mit TTL check)
+                # Nochmal checken, ob inzwischen gecached oder in failed
                 now = time.time()
                 with self._lock:
                     if username in self._cache:
                         self._queue.task_done()
                         continue
                     
-                    # Failed user check (falls zwischenzeitlich failed wurde)
+                    # Failed user check
                     if username in self._failed_users:
                         failed_time = self._failed_users[username]
                         if now - failed_time < self.failed_retry_seconds:
@@ -202,13 +207,14 @@ class ADLocationLookup:
 
                 with self._lock:
                     if location and location != "Unknown":
-                        self._cache[username] = (location, now)  # NEU: mit Zeitstempel
+                        self._cache[username] = location  # PERMANENT im Cache
                         self._failed_users.pop(username, None)
-                        logger.debug(f"AD Worker: '{username}' -> '{location}' erfolgreich")
+                        cache_size = len(self._cache)
+                        logger.info(f"AD Worker: '{username}' -> '{location}' erfolgreich (Cache: {cache_size} User)")
                     else:
-                        self._failed_users[username] = now
-                        # Kein Cache-Eintrag für Unknown
-                        logger.debug(f"AD Worker: '{username}' als failed markiert")
+                        self._failed_users[username] = now  # Failed User mit Zeitstempel
+                        failed_count = len(self._failed_users)
+                        logger.info(f"AD Worker: '{username}' als failed markiert (Failed: {failed_count} User)")
 
                 self._queue.task_done()
                 
@@ -216,6 +222,17 @@ class ADLocationLookup:
                 logger.error(f"AD Worker: Kritischer Fehler in Worker-Loop: {e}")
                 
         logger.info("AD Worker Thread beendet")
+
+
+    
+    def log_cache_stats(self):
+        """Loggt aktuelle Cache-Statistiken"""
+        with self._lock:
+            total_users = len(self._cache)
+            failed_users = len(self._failed_users)
+            
+            logger.info(f"CACHE STATS: {total_users} User permanent gecacht, {failed_users} failed")
+    
 
     
     def _query_ad(self, username: str) -> Optional[str]:
@@ -489,7 +506,7 @@ class MultiFlexLMExporter:
         # AD Location Lookup (shared)
         ad_domain = self.config.get('ad_domain', 'patec.group')
         cache_file = self.config.get('cache_file', 'ad_cache.json')
-        self.ad_lookup = ADLocationLookup(domain=ad_domain, cache_file=cache_file, cache_ttl_hours=0.6)
+        self.ad_lookup = ADLocationLookup(domain=ad_domain, cache_file=cache_file)
         
         # Shared Prometheus Metrics (einmal erstellt, von allen Servern verwendet)
         self.metrics = {
@@ -601,6 +618,11 @@ class MultiFlexLMExporter:
                 try:
                     time.sleep(30)
                     self.collect_metrics()
+                    
+                    # Alle 10 Minuten Cache-Statistik loggen
+                    if int(time.time()) % 600 < 30:  # Alle 10 Minuten
+                        self.ad_lookup.log_cache_stats()
+                        
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
