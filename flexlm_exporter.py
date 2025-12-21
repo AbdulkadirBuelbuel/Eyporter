@@ -15,15 +15,27 @@ import queue
 import json
 import signal
 import yaml 
+import sys
+
+if sys.platform == 'win32':
+    try:
+        import io
+        if hasattr(sys.stdout, 'buffer'):
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+        if hasattr(sys.stderr, 'buffer'):
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    except Exception:
+        pass
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
+
 class ADLocationLookup:
     """AD City Lookup mit Hintergrund-Thread und Cache, blockiert Scrapes nicht."""
     def __init__(self, domain: str = 'patec.group', cache_file: str = 'ad_cache.json', 
-                 failed_retry_hours: int = 0.2):  # Nur noch Failed-User TTL
+                 failed_retry_hours: int = 0.2):  
         self.domain = domain
         self.cache_file = cache_file
         self.failed_retry_seconds = failed_retry_hours * 3600 
@@ -344,6 +356,7 @@ class FlexLMExporter:
             self.feature_used = metrics['feature_used']
             self.feature_available = metrics['feature_available']
             self.user_licenses = metrics['user_licenses']
+            self.user_license_start_time = metrics['user_license_start_time']  # NEU
             self.location_licenses = metrics['location_licenses']
             self.location_users = metrics['location_users']
             self.host_licenses = metrics['host_licenses']
@@ -357,6 +370,7 @@ class FlexLMExporter:
             self.feature_used = Gauge('flexlm_feature_used_licenses', 'Used Licenses', ['server','server_name','vendor','feature'])
             self.feature_available = Gauge('flexlm_feature_available_licenses', 'Available Licenses', ['server','server_name','vendor','feature'])
             self.user_licenses = Gauge('flexlm_user_licenses', 'User License', ['server','server_name','vendor','feature','user','hostname','display','location'])
+            self.user_license_start_time = Gauge('flexlm_user_license_start_time', 'License Start Time (Unix Timestamp)', ['server','server_name','vendor','feature','user','hostname','display'])  # NEU
             self.location_licenses = Gauge('flexlm_location_licenses_total', 'Licenses per Location', ['server','server_name','location','feature'])
             self.location_users = Gauge('flexlm_location_users_total', 'Users per Location', ['server','server_name','location'])
             self.host_licenses = Gauge('flexlm_host_licenses_total', 'Licenses per Host', ['server','server_name','hostname','location'])
@@ -386,7 +400,8 @@ class FlexLMExporter:
         
         feature_hdr_re = re.compile(r'^Users of\s+([\w\-\.\+]+):\s+\(Total of\s+(\d+)\s+licenses?.*Total of\s+(\d+)\s+licenses? in use\)', re.IGNORECASE)
         daemon_re = re.compile(r'(\w+): UP v([0-9.]+)')
-        user_line_re = re.compile(r'^\s*(\S+)\s+(\S+)\s+(\S+)\s+\([^)]+\)\s+\([^)]+\s+\d+\)', re.IGNORECASE)
+        # Erweitert um Start-Zeit: (v31.0) (server/port lmgrd_port), start Tue 12/16 8:56
+        user_line_re = re.compile(r'^\s*(\S+)\s+(\S+)\s+(\S+)\s+\([^)]+\)\s+\([^)]+\s+\d+\),\s+start\s+(.+)$', re.IGNORECASE)
         
         for raw in lines:
             line = raw.strip()
@@ -421,16 +436,44 @@ class FlexLMExporter:
                     username = um.group(1)
                     hostname = um.group(2)
                     display = um.group(3)
+                    start_time_str = um.group(4).strip()  # z.B. "Tue 12/16 8:56"
+                    
+                    # Parse Start-Zeit zu Unix Timestamp (mit aktuellem Jahr)
+                    start_timestamp = self._parse_start_time(start_time_str)
+                    
                     user_dict = {
                         'username': username,
                         'hostname': hostname,
                         'display': display,
-                        'feature': current_feature['name']
+                        'feature': current_feature['name'],
+                        'start_time': start_timestamp  # NEU
                     }
                     current_feature['users'].append(user_dict)
                     data['users'].append(user_dict)
         
         return data
+
+    def _parse_start_time(self, start_str: str) -> float:
+        """
+        Konvertiert FlexLM Start-Zeit String zu Unix Timestamp
+        Format: "Tue 12/16 8:56" (ohne Jahr, ohne Sekunden)
+        """
+        try:
+            from datetime import datetime
+            import time as time_module
+            
+            # Aktuelles Jahr hinzufügen
+            current_year = datetime.now().year
+            # Format: "Tue 12/16 8:56" -> "2024 12/16 8:56"
+            time_str_with_year = f"{current_year} {start_str.split(' ', 1)[1]}"
+            
+            # Parse: "2024 12/16 8:56"
+            dt = datetime.strptime(time_str_with_year, "%Y %m/%d %H:%M")
+            
+            return dt.timestamp()
+        except Exception as e:
+            logger.debug(f"Fehler beim Parsen der Start-Zeit '{start_str}': {e}")
+            return 0.0  # Fallback
 
     def collect_metrics(self):
         start = time.time()
@@ -469,11 +512,22 @@ class FlexLMExporter:
                     location=location
                 ).set(1)
 
+                if u.get('start_time', 0) > 0:
+                    self.user_license_start_time.labels(
+                        server=self.server_label,
+                        server_name=self.name,
+                        vendor=self.vendor,
+                        feature=feature['name'],
+                        user=u['username'],
+                        hostname=u['hostname'],
+                        display=u['display']
+                    ).set(u['start_time'])
+
                 loc_counts[(location, feature['name'])] = loc_counts.get((location, feature['name']), 0) + 1
 
             for (loc, feat), cnt in loc_counts.items():
                 self.location_licenses.labels(server=self.server_label, server_name=self.name, location=loc, feature=feat).set(cnt)
-        
+
         # Host und Location aggregiert
         host_counts = {}
         loc_user_sets = {}
@@ -493,8 +547,7 @@ class FlexLMExporter:
         self.scrape_duration.labels(server=self.server_label, server_name=self.name).set(time.time() - start)
         logger.info(f"Collected {self.name}: {len(data['features'])} features, {len(data['users'])} users")
         
-        return data['users']  # Für Preload
-
+        return data['users']
 
     
 class MultiFlexLMExporter:
@@ -515,6 +568,7 @@ class MultiFlexLMExporter:
             'feature_used': Gauge('flexlm_feature_used_licenses', 'Used Licenses', ['server','server_name','vendor','feature']),
             'feature_available': Gauge('flexlm_feature_available_licenses', 'Available Licenses', ['server','server_name','vendor','feature']),
             'user_licenses': Gauge('flexlm_user_licenses', 'User License', ['server','server_name','vendor','feature','user','hostname','display','location']),
+            'user_license_start_time': Gauge('flexlm_user_license_start_time', 'License Start Time (Unix Timestamp)', ['server','server_name','vendor','feature','user','hostname','display']),  # NEU
             'location_licenses': Gauge('flexlm_location_licenses_total', 'Licenses per Location', ['server','server_name','location','feature']),
             'location_users': Gauge('flexlm_location_users_total', 'Users per Location', ['server','server_name','location']),
             'host_licenses': Gauge('flexlm_host_licenses_total', 'Licenses per Host', ['server','server_name','hostname','location']),
