@@ -356,10 +356,8 @@ class FlexLMExporter:
             self.feature_used = metrics['feature_used']
             self.feature_available = metrics['feature_available']
             self.user_licenses = metrics['user_licenses']
-            self.user_license_start_time = metrics['user_license_start_time']  # NEU
             self.location_licenses = metrics['location_licenses']
             self.location_users = metrics['location_users']
-            self.host_licenses = metrics['host_licenses']
             self.daemon_up = metrics['daemon_up']
             self.scrape_duration = metrics['scrape_duration']
             self.scrape_errors = metrics['scrape_errors']
@@ -369,11 +367,9 @@ class FlexLMExporter:
             self.feature_total = Gauge('flexlm_feature_total_licenses', 'Total Licenses', ['server','server_name','vendor','feature'])
             self.feature_used = Gauge('flexlm_feature_used_licenses', 'Used Licenses', ['server','server_name','vendor','feature'])
             self.feature_available = Gauge('flexlm_feature_available_licenses', 'Available Licenses', ['server','server_name','vendor','feature'])
-            self.user_licenses = Gauge('flexlm_user_licenses', 'User License', ['server','server_name','vendor','feature','user','hostname','display','location'])
-            self.user_license_start_time = Gauge('flexlm_user_license_start_time', 'License Start Time (Unix Timestamp)', ['server','server_name','vendor','feature','user','hostname','display'])  # NEU
+            self.user_licenses = Gauge('flexlm_user_licenses', 'User License Start Time (Unix Timestamp)', ['server','server_name','vendor','feature','user','hostname','display','location'])
             self.location_licenses = Gauge('flexlm_location_licenses_total', 'Licenses per Location', ['server','server_name','location','feature'])
             self.location_users = Gauge('flexlm_location_users_total', 'Users per Location', ['server','server_name','location'])
-            self.host_licenses = Gauge('flexlm_host_licenses_total', 'Licenses per Host', ['server','server_name','hostname','location'])
             self.daemon_up = Gauge('flexlm_daemon_up', 'Daemon Status', ['server','server_name','daemon','version'])
             self.scrape_duration = Gauge('flexlm_scrape_duration_seconds', 'Scrape Duration', ['server','server_name'])
             self.scrape_errors = Counter('flexlm_scrape_errors_total', 'Scrape Errors', ['server','server_name'])
@@ -500,6 +496,7 @@ class FlexLMExporter:
             loc_counts = {}
             for u in feature['users']:
                 location = self.ad_lookup.get_location(u['username'])
+                start_time = u.get('start_time', 0)
 
                 self.user_licenses.labels(
                     server=self.server_label,
@@ -510,36 +507,19 @@ class FlexLMExporter:
                     hostname=u['hostname'],
                     display=u['display'],
                     location=location
-                ).set(1)
-
-                if u.get('start_time', 0) > 0:
-                    self.user_license_start_time.labels(
-                        server=self.server_label,
-                        server_name=self.name,
-                        vendor=self.vendor,
-                        feature=feature['name'],
-                        user=u['username'],
-                        hostname=u['hostname'],
-                        display=u['display']
-                    ).set(u['start_time'])
+                ).set(start_time)
 
                 loc_counts[(location, feature['name'])] = loc_counts.get((location, feature['name']), 0) + 1
 
             for (loc, feat), cnt in loc_counts.items():
                 self.location_licenses.labels(server=self.server_label, server_name=self.name, location=loc, feature=feat).set(cnt)
 
-        # Host und Location aggregiert
-        host_counts = {}
+        # Location aggregiert
         loc_user_sets = {}
         
         for u in data['users']:
             location = self.ad_lookup.get_location(u['username'])
-            hk = (u['hostname'], location)
-            host_counts[hk] = host_counts.get(hk, 0) + 1
             loc_user_sets.setdefault(location, set()).add(u['username'])
-        
-        for (hn, loc), cnt in host_counts.items():
-            self.host_licenses.labels(server=self.server_label, server_name=self.name, hostname=hn, location=loc).set(cnt)
         
         for loc, users in loc_user_sets.items():
             self.location_users.labels(server=self.server_label, server_name=self.name, location=loc).set(len(users))
@@ -567,11 +547,9 @@ class MultiFlexLMExporter:
             'feature_total': Gauge('flexlm_feature_total_licenses', 'Total Licenses', ['server','server_name','vendor','feature']),
             'feature_used': Gauge('flexlm_feature_used_licenses', 'Used Licenses', ['server','server_name','vendor','feature']),
             'feature_available': Gauge('flexlm_feature_available_licenses', 'Available Licenses', ['server','server_name','vendor','feature']),
-            'user_licenses': Gauge('flexlm_user_licenses', 'User License', ['server','server_name','vendor','feature','user','hostname','display','location']),
-            'user_license_start_time': Gauge('flexlm_user_license_start_time', 'License Start Time (Unix Timestamp)', ['server','server_name','vendor','feature','user','hostname','display']),  # NEU
+            'user_licenses': Gauge('flexlm_user_licenses', 'User License Start Time (Unix Timestamp)', ['server','server_name','vendor','feature','user','hostname','display','location']),
             'location_licenses': Gauge('flexlm_location_licenses_total', 'Licenses per Location', ['server','server_name','location','feature']),
             'location_users': Gauge('flexlm_location_users_total', 'Users per Location', ['server','server_name','location']),
-            'host_licenses': Gauge('flexlm_host_licenses_total', 'Licenses per Host', ['server','server_name','hostname','location']),
             'daemon_up': Gauge('flexlm_daemon_up', 'Daemon Status', ['server','server_name','daemon','version']),
             'scrape_duration': Gauge('flexlm_scrape_duration_seconds', 'Scrape Duration', ['server','server_name']),
             'scrape_errors': Counter('flexlm_scrape_errors_total', 'Scrape Errors', ['server','server_name'])
