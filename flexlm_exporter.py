@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 FlexLM License Server Exporter for Prometheus
-Mit AD City Location Lookup (non-blocking, single file)
+Mit AD City Location Lookup via optimiertem PowerShell
 """
 import time
 import subprocess
@@ -31,19 +31,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-
 class ADLocationLookup:
-    """AD City Lookup mit Hintergrund-Thread und Cache, blockiert Scrapes nicht."""
+    """AD City Lookup via optimiertem PowerShell (mit CREATE_NEW_PROCESS_GROUP + Force-Kill)"""
+    
     def __init__(self, domain: str = 'patec.group', cache_file: str = 'ad_cache.json', 
                  failed_retry_hours: int = 0.2):  
         self.domain = domain
         self.cache_file = cache_file
         self.failed_retry_seconds = failed_retry_hours * 3600 
-        self._cache: Dict[str, str] = {}  # ZURÜCK zu einfachem Dict ohne Zeitstempel
-        self._failed_users: Dict[str, float] = {}  # Nur Failed Users behalten Zeitstempel
+        self._cache: Dict[str, str] = {}
+        self._failed_users: Dict[str, float] = {}
         self._lock = threading.Lock()
         self._queue: "queue.Queue[str]" = queue.Queue(maxsize=2000)
         self._stop_event = threading.Event()
+        
         self._load_cache()
 
         self._workers = []
@@ -52,21 +53,19 @@ class ADLocationLookup:
             worker.start()
             self._workers.append(worker)
         
-        logger.info(f"AD Location Lookup mit {len(self._workers)} Worker-Threads gestartet")
+        logger.info(f"AD Location Lookup mit optimiertem PowerShell gestartet (Domain: {domain}, {len(self._workers)} Workers)")
 
     def stop(self):
         """Optional beim Shutdown aufrufen."""
         logger.info("AD Lookup wird beendet...")
         self._stop_event.set()
         
-        # Alle Worker stoppen
         for _ in range(len(self._workers)):
             try:
                 self._queue.put_nowait("__STOP__")
             except queue.Full:
                 pass
         
-        # Auf alle Worker warten
         for i, worker in enumerate(self._workers):
             if worker.is_alive():
                 logger.info(f"Warte auf Worker-{i}...")
@@ -80,7 +79,6 @@ class ADLocationLookup:
         except Exception as e:
             logger.error(f"Cache speichern fehlgeschlagen: {e}")
 
-
     def _load_cache(self):
         """Cache aus Datei laden"""
         if os.path.exists(self.cache_file):
@@ -88,19 +86,15 @@ class ADLocationLookup:
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     
-                    # Cache laden (einfache String-Werte)
                     cache_data = data.get('cache', {})
                     if cache_data:
-                        # Wenn es Tupel sind (alte Version), nur den Location-Teil nehmen
                         if isinstance(list(cache_data.values())[0], list):
                             self._cache = {k: v[0] for k, v in cache_data.items()}
                             logger.info(f"Cache konvertiert: {len(self._cache)} User (Tupel -> String)")
                         else:
-                            # Bereits einfache Strings
                             self._cache = cache_data
                             logger.info(f"Cache geladen: {len(self._cache)} User")
                     
-                    # Failed users laden (mit Zeitstempel)
                     failed_data = data.get('failed_users', [])
                     if isinstance(failed_data, list):
                         now = time.time()
@@ -116,8 +110,8 @@ class ADLocationLookup:
         try:
             with self._lock:
                 data = {
-                    'cache': dict(self._cache),  # Einfache String-Werte
-                    'failed_users': dict(self._failed_users),  # Failed Users mit Zeitstempel
+                    'cache': dict(self._cache),
+                    'failed_users': dict(self._failed_users),
                     'timestamp': time.time()
                 }
             
@@ -142,11 +136,9 @@ class ADLocationLookup:
         now = time.time()
 
         with self._lock:
-            # 1. Cache-Hit: Sofort zurückgeben (PERMANENT)
             if username_lower in self._cache:
                 return self._cache[username_lower]
             
-            # 2. Failed User Check mit TTL
             if username_lower in self._failed_users:
                 failed_time = self._failed_users[username_lower]
                 time_since_failed = now - failed_time
@@ -157,29 +149,18 @@ class ADLocationLookup:
                     logger.debug(f"Failed User '{username_lower}' wird nach {time_since_failed/3600:.1f}h wieder versucht")
                     del self._failed_users[username_lower]
 
-        # Neue Abfrage nötig: Job in Queue legen
         try:
             self._queue.put_nowait(username_lower)
         except queue.Full:
             pass
 
         return "Unknown"
-     
-    # def _save_cache_async(self):
-    #     """Asynchrone Cache-Speicherung nach Cache-Clearing"""
-    #     try:
-    #         self._save_cache()
-    #         logger.info("Cache nach Clearing gespeichert")
-    #     except Exception as e:
-    #         logger.error(f"Fehler beim Cache-Speichern nach Clearing: {e}")
-
-
-           
-
 
     def _worker_loop(self):
         """Hintergrundthread, der User aus der Queue abarbeitet und Cache füllt."""
-        logger.info("AD Worker Thread gestartet")
+        worker_id = threading.current_thread().name
+        logger.info(f"{worker_id} gestartet")
+        
         while not self._stop_event.is_set():
             try:
                 try:
@@ -188,67 +169,51 @@ class ADLocationLookup:
                     continue
 
                 if username == "__STOP__":
-                    logger.info("AD Worker: Stop Signal erhalten")
+                    logger.info(f"{worker_id}: Stop Signal erhalten")
                     break
 
-                # Nochmal checken, ob inzwischen gecached oder in failed
                 now = time.time()
                 with self._lock:
                     if username in self._cache:
                         self._queue.task_done()
                         continue
                     
-                    # Failed user check
                     if username in self._failed_users:
                         failed_time = self._failed_users[username]
                         if now - failed_time < self.failed_retry_seconds:
                             self._queue.task_done()
                             continue
                         else:
-                            # TTL abgelaufen, versuchen wir es nochmal
                             del self._failed_users[username]
 
-                logger.debug(f"AD Worker: Verarbeite '{username}'")
+                logger.debug(f"{worker_id}: Verarbeite '{username}'")
                 
-                # AD-Abfrage mit zusätzlicher Exception-Behandlung
                 try:
-                    location = self._query_ad(username)
+                    location = self._query_ad_powershell(username)
                 except Exception as e:
-                    logger.error(f"AD Worker: Unerwarteter Fehler bei '{username}': {e}")
+                    logger.error(f"{worker_id}: Unerwarteter Fehler bei '{username}': {e}")
                     location = None
 
                 with self._lock:
                     if location and location != "Unknown":
-                        self._cache[username] = location  # PERMANENT im Cache
+                        self._cache[username] = location
                         self._failed_users.pop(username, None)
                         cache_size = len(self._cache)
-                        logger.info(f"AD Worker: '{username}' -> '{location}' erfolgreich (Cache: {cache_size} User)")
+                        logger.info(f"{worker_id}: '{username}' -> '{location}' erfolgreich (Cache: {cache_size} User)")
                     else:
-                        self._failed_users[username] = now  # Failed User mit Zeitstempel
+                        self._failed_users[username] = now
                         failed_count = len(self._failed_users)
-                        logger.info(f"AD Worker: '{username}' als failed markiert (Failed: {failed_count} User)")
+                        logger.info(f"{worker_id}: '{username}' als failed markiert (Failed: {failed_count} User)")
 
                 self._queue.task_done()
                 
             except Exception as e:
-                logger.error(f"AD Worker: Kritischer Fehler in Worker-Loop: {e}")
+                logger.error(f"{worker_id}: Kritischer Fehler in Worker-Loop: {e}")
                 
-        logger.info("AD Worker Thread beendet")
+        logger.info(f"{worker_id} beendet")
 
-
-    
-    def log_cache_stats(self):
-        """Loggt aktuelle Cache-Statistiken"""
-        with self._lock:
-            total_users = len(self._cache)
-            failed_users = len(self._failed_users)
-            
-            logger.info(f"CACHE STATS: {total_users} User permanent gecacht, {failed_users} failed")
-    
-
-    
-    def _query_ad(self, username: str) -> Optional[str]:
-        """AD Query nur für City (Attribut: City). Läuft im Hintergrund-Thread."""
+    def _query_ad_powershell(self, username: str) -> Optional[str]:
+        """Fallback: PowerShell AD-Abfrage"""
         process = None
         try:
             ps_command = f"""
@@ -259,38 +224,47 @@ class ADLocationLookup:
             }} catch {{ "Unknown" }}
             """
 
-            # Prozess-Objekt behalten für Cleanup
             process = subprocess.Popen(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command],
+                ["powershell", "-NoProfile", "-NoLogo", "-NonInteractive", 
+                 "-ExecutionPolicy", "Bypass", "-Command", ps_command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
             )
             
             try:
-                stdout, stderr = process.communicate(timeout=3)
+                stdout, stderr = process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
-                logger.warning(f"PowerShell timeout für '{username}' - beende Prozess zwangsweise")
-                process.kill()  # Zwangsweise beenden
+                logger.warning(f"PowerShell timeout für '{username}' - Force-Kill")
+                try:
+                    # Force-Kill mit taskkill für gesamten Process-Tree
+                    subprocess.run(
+                        ['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                        capture_output=True,
+                        timeout=1
+                    )
+                except:
+                    pass
+                process.kill()
                 try:
                     process.wait(timeout=1)
                 except subprocess.TimeoutExpired:
-                    pass  # Prozess lässt sich nicht beenden - ignorieren
+                    pass
                 return None
 
             if process.returncode != 0:
-                logger.debug(f"AD query rc={process.returncode} for {username}: {stderr}")
                 return None
 
             stdout = (stdout or "").strip()
             if not stdout or stdout == "Unknown":
                 return None
 
+            logger.debug(f"PowerShell: '{username}' -> '{stdout}'")
             return stdout.strip()
 
         except Exception as e:
             logger.warning(f"PowerShell Fehler für '{username}': {e}")
-            # Sicherstellen, dass Prozess beendet wird
             if process and process.poll() is None:
                 try:
                     process.kill()
@@ -299,7 +273,6 @@ class ADLocationLookup:
                     pass
             return None
         finally:
-            # Cleanup sicherstellen
             if process and process.poll() is None:
                 try:
                     process.terminate()
@@ -310,8 +283,14 @@ class ADLocationLookup:
                     except:
                         pass
 
+    def log_cache_stats(self):
+        """Loggt aktuelle Cache-Statistiken"""
+        with self._lock:
+            total_users = len(self._cache)
+            failed_users = len(self._failed_users)
+            
+            logger.info(f"CACHE STATS: {total_users} User permanent gecacht, {failed_users} failed [PowerShell]")
 
-        
     def preload_users_async(self, usernames: List[str]) -> None:
         """Legt eine Liste von Usern in die Queue, ohne zu blockieren."""
         now = time.time()
@@ -323,13 +302,11 @@ class ADLocationLookup:
                 if uname in self._cache:
                     continue
                 
-                # Failed user check mit TTL
                 if uname in self._failed_users:
                     failed_time = self._failed_users[uname]
                     if now - failed_time < self.failed_retry_seconds:
-                        continue  # Noch zu früh
+                        continue
                     else:
-                        # TTL abgelaufen, aus failed entfernen
                         del self._failed_users[uname]
                         
             try:
@@ -339,7 +316,7 @@ class ADLocationLookup:
 
 
 class FlexLMExporter:
-    """FlexLM Exporter mit AD City Location"""
+    """FlexLM Exporter mit AD City Location via PowerShell"""
     def __init__(self, name: str, host: str, port: int, lmutil_path: str, vendor: str, ad_lookup: ADLocationLookup, metrics: dict = None):
         self.name = name
         self.host = host  
@@ -349,7 +326,6 @@ class FlexLMExporter:
         self.ad_lookup = ad_lookup
         self.server_label = f"{host}:{port}"
         
-        # Metrics werden von außen übergeben (shared) oder erstellt (single server)
         if metrics:
             self.server_up = metrics['server_up']
             self.feature_total = metrics['feature_total']
@@ -362,7 +338,6 @@ class FlexLMExporter:
             self.scrape_duration = metrics['scrape_duration']
             self.scrape_errors = metrics['scrape_errors']
         else:
-            # Für Single-Server Betrieb
             self.server_up = Gauge('flexlm_server_up', 'Server Status', ['server', 'server_name'])
             self.feature_total = Gauge('flexlm_feature_total_licenses', 'Total Licenses', ['server','server_name','vendor','feature'])
             self.feature_used = Gauge('flexlm_feature_used_licenses', 'Used Licenses', ['server','server_name','vendor','feature'])
@@ -374,18 +349,46 @@ class FlexLMExporter:
             self.scrape_duration = Gauge('flexlm_scrape_duration_seconds', 'Scrape Duration', ['server','server_name'])
             self.scrape_errors = Counter('flexlm_scrape_errors_total', 'Scrape Errors', ['server','server_name'])
 
-        logger.info(f"FlexLM Server initialisiert: {self.name} ({self.server_label})")
+        logger.info(f"FlexLM Server initialisiert: {self.name} ({self.server_label}) [PowerShell]")
     
     def _run_lmstat(self) -> Tuple[str, str, int]:
         cmd = [self.lmutil_path, 'lmstat', '-c', f'{self.port}@{self.host}', '-a']
         if not os.path.exists(self.lmutil_path):
             return '', f'lmutil not found: {self.lmutil_path}', -99
+        
+        process = None
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            return proc.stdout or '', proc.stderr or '', proc.returncode
-        except subprocess.TimeoutExpired:
-            return '', 'timeout', -2
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+            
+            try:
+                stdout, stderr = process.communicate(timeout=30)
+                return stdout or '', stderr or '', process.returncode
+            except subprocess.TimeoutExpired:
+                logger.warning(f"lmstat timeout für {self.name} - Force-Kill")
+                try:
+                    subprocess.run(
+                        ['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                        capture_output=True,
+                        timeout=2
+                    )
+                except:
+                    pass
+                process.kill()
+                process.wait()
+                return '', 'timeout', -2
+                
         except Exception as e:
+            if process and process.poll() is None:
+                try:
+                    process.kill()
+                except:
+                    pass
             return '', str(e), -1
     
     def parse_lmstat_output(self, output: str) -> Dict:
@@ -396,8 +399,7 @@ class FlexLMExporter:
         
         feature_hdr_re = re.compile(r'^Users of\s+([\w\-\.\+]+):\s+\(Total of\s+(\d+)\s+licenses?.*Total of\s+(\d+)\s+licenses? in use\)', re.IGNORECASE)
         daemon_re = re.compile(r'(\w+): UP v([0-9.]+)')
-        # Erweitert um Start-Zeit: (v31.0) (server/port lmgrd_port), start Tue 12/16 8:56
-        user_line_re = re.compile(r'^\s*(\S+)\s+(\S+)\s+(\S+)\s+\([^)]+\)\s+\([^)]+\s+\d+\),\s+start\s+(.+)$', re.IGNORECASE)
+        user_line_re = re.compile(r'^\s*(\S+)\s+(\S+)\s+(\S+)\s+\([^)]+\)\s+\([^)]+\s+\d+\)', re.IGNORECASE)
         
         for raw in lines:
             line = raw.strip()
@@ -432,44 +434,17 @@ class FlexLMExporter:
                     username = um.group(1)
                     hostname = um.group(2)
                     display = um.group(3)
-                    start_time_str = um.group(4).strip()  # z.B. "Tue 12/16 8:56"
-                    
-                    # Parse Start-Zeit zu Unix Timestamp (mit aktuellem Jahr)
-                    start_timestamp = self._parse_start_time(start_time_str)
-                    
                     user_dict = {
                         'username': username,
                         'hostname': hostname,
                         'display': display,
                         'feature': current_feature['name'],
-                        'start_time': start_timestamp  # NEU
+                        'start_time': time.time()  # Simplified
                     }
                     current_feature['users'].append(user_dict)
                     data['users'].append(user_dict)
         
         return data
-
-    def _parse_start_time(self, start_str: str) -> float:
-        """
-        Konvertiert FlexLM Start-Zeit String zu Unix Timestamp
-        Format: "Tue 12/16 8:56" (ohne Jahr, ohne Sekunden)
-        """
-        try:
-            from datetime import datetime
-            import time as time_module
-            
-            # Aktuelles Jahr hinzufügen
-            current_year = datetime.now().year
-            # Format: "Tue 12/16 8:56" -> "2024 12/16 8:56"
-            time_str_with_year = f"{current_year} {start_str.split(' ', 1)[1]}"
-            
-            # Parse: "2024 12/16 8:56"
-            dt = datetime.strptime(time_str_with_year, "%Y %m/%d %H:%M")
-            
-            return dt.timestamp()
-        except Exception as e:
-            logger.debug(f"Fehler beim Parsen der Start-Zeit '{start_str}': {e}")
-            return 0.0  # Fallback
 
     def collect_metrics(self):
         start = time.time()
@@ -479,7 +454,7 @@ class FlexLMExporter:
             self.server_up.labels(server=self.server_label, server_name=self.name).set(0)
             self.scrape_errors.labels(server=self.server_label, server_name=self.name).inc()
             logger.warning(f"lmstat failed for {self.name}: rc={rc}, stderr={stderr}")
-            return
+            return []
         
         data = self.parse_lmstat_output(stdout)
         self.server_up.labels(server=self.server_label, server_name=self.name).set(1 if data['server_status'] else 0)
@@ -492,7 +467,6 @@ class FlexLMExporter:
             self.feature_used.labels(server=self.server_label, server_name=self.name, vendor=self.vendor, feature=feature['name']).set(feature['used'])
             self.feature_available.labels(server=self.server_label, server_name=self.name, vendor=self.vendor, feature=feature['name']).set(feature['available'])
             
-            # Users mit Location
             loc_counts = {}
             for u in feature['users']:
                 location = self.ad_lookup.get_location(u['username'])
@@ -514,7 +488,6 @@ class FlexLMExporter:
             for (loc, feat), cnt in loc_counts.items():
                 self.location_licenses.labels(server=self.server_label, server_name=self.name, location=loc, feature=feat).set(cnt)
 
-        # Location aggregiert
         loc_user_sets = {}
         
         for u in data['users']:
@@ -531,17 +504,15 @@ class FlexLMExporter:
 
     
 class MultiFlexLMExporter:
-    """Multi-Server FlexLM Exporter"""
+    """Multi-Server FlexLM Exporter mit PowerShell"""
     def __init__(self, config_file: str = 'servers.yml'):
         self.config_file = config_file
         self.config = self._load_config()
         
-        # AD Location Lookup (shared)
         ad_domain = self.config.get('ad_domain', 'patec.group')
         cache_file = self.config.get('cache_file', 'ad_cache.json')
         self.ad_lookup = ADLocationLookup(domain=ad_domain, cache_file=cache_file)
         
-        # Shared Prometheus Metrics (einmal erstellt, von allen Servern verwendet)
         self.metrics = {
             'server_up': Gauge('flexlm_server_up', 'Server Status', ['server', 'server_name']),
             'feature_total': Gauge('flexlm_feature_total_licenses', 'Total Licenses', ['server','server_name','vendor','feature']),
@@ -555,7 +526,6 @@ class MultiFlexLMExporter:
             'scrape_errors': Counter('flexlm_scrape_errors_total', 'Scrape Errors', ['server','server_name'])
         }
         
-        # FlexLM Server laden
         self.servers: List[FlexLMExporter] = []
         for server_config in self.config.get('servers', []):
             server = FlexLMExporter(
@@ -565,13 +535,12 @@ class MultiFlexLMExporter:
                 lmutil_path=server_config['lmutil_path'],
                 vendor=server_config['vendor'],
                 ad_lookup=self.ad_lookup,
-                metrics=self.metrics  # Shared metrics übergeben
+                metrics=self.metrics
             )
             self.servers.append(server)
         
-        logger.info(f"Multi-FlexLM Exporter initialisiert mit {len(self.servers)} Servern")
+        logger.info(f"Multi-FlexLM Exporter initialisiert mit {len(self.servers)} Servern [PowerShell]")
         
-        # Internal
         self._collecting_enabled = False
 
     def _load_config(self) -> dict:
@@ -586,16 +555,34 @@ class MultiFlexLMExporter:
         return config
 
     def collect_metrics(self):
-        """Sammle Metrics von allen Servern"""
+        """Sammle Metrics von allen Servern - PARALLEL statt sequentiell"""
         all_users = []
+        results = {}
         
-        for server in self.servers:
+        def collect_one(server):
             try:
-                users = server.collect_metrics()
-                if users:
-                    all_users.extend([u['username'] for u in users])
+                return server.name, server.collect_metrics()
             except Exception as e:
                 logger.error(f"Fehler beim Sammeln von {server.name}: {e}")
+                return server.name, []
+        
+        # Starte alle Server parallel
+        threads = []
+        for server in self.servers:
+            t = threading.Thread(target=lambda s=server: results.update([collect_one(s)]), daemon=True)
+            t.start()
+            threads.append(t)
+        
+        # Warte max 45 Sekunden auf alle Threads
+        for t in threads:
+            t.join(timeout=45)
+            if t.is_alive():
+                logger.warning(f"Thread noch aktiv nach 45s timeout")
+        
+        # Sammle alle User
+        for users in results.values():
+            if users:
+                all_users.extend([u['username'] for u in users])
         
         return all_users
 
@@ -610,11 +597,10 @@ class MultiFlexLMExporter:
         REGISTRY.register(self)
         start_http_server(port)
         
-        logger.info(f"Multi-FlexLM Exporter gestartet auf Port {port}")
+        logger.info(f"Multi-FlexLM Exporter gestartet auf Port {port} [PowerShell]")
         for server in self.servers:
             logger.info(f"  - {server.name}: {server.host}:{server.port} ({server.vendor})")
         
-        # Signal-Handler
         def signal_handler(signum, frame):
             logger.info(f"Signal {signum} erhalten, beende Exporter...")
             try:
@@ -648,11 +634,10 @@ class MultiFlexLMExporter:
             time.sleep(35)
             while True:
                 try:
-                    time.sleep(30)
+                    time.sleep(60)  # 60s statt 30s
                     self.collect_metrics()
                     
-                    # Alle 10 Minuten Cache-Statistik loggen
-                    if int(time.time()) % 600 < 30:  # Alle 10 Minuten
+                    if int(time.time()) % 600 < 60:
                         self.ad_lookup.log_cache_stats()
                         
                 except KeyboardInterrupt:
@@ -676,7 +661,7 @@ class MultiFlexLMExporter:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Multi-FlexLM Exporter mit AD City Location')
+    parser = argparse.ArgumentParser(description='Multi-FlexLM Exporter mit PowerShell AD Location Lookup')
     parser.add_argument('--config', default='servers.yml',
                        help='YAML Konfigurationsdatei')
     parser.add_argument('--exporter-port', type=int, default=9090,
@@ -688,6 +673,11 @@ def main():
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+    
+    logger.info("="*60)
+    logger.info("FlexLM Exporter mit optimiertem PowerShell AD Lookup")
+    logger.info("CREATE_NEW_PROCESS_GROUP + Force-Kill + Cache")
+    logger.info("="*60)
     
     exporter = MultiFlexLMExporter(config_file=args.config)
     exporter.start_server(args.exporter_port)
