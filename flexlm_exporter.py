@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 FlexLM License Server Exporter for Prometheus
-Mit AD City Location Lookup via optimiertem PowerShell
+Mit AD City Location Lookup via optimiertem PowerShell (Batch-Abfragen)
 """
 import time
 import subprocess
@@ -31,19 +31,60 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _kill_process_tree(process):
+    """Force-kill einen Subprocess und seinen gesamten Process-Tree."""
+    if process is None:
+        return
+    try:
+        if process.poll() is not None:
+            return
+        try:
+            subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                capture_output=True, timeout=3
+            )
+        except Exception:
+            pass
+        try:
+            process.kill()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 class ADLocationLookup:
-    """AD City Lookup via optimiertem PowerShell (mit CREATE_NEW_PROCESS_GROUP + Force-Kill)"""
+    """AD City Lookup via PowerShell mit Batch-Abfragen.
+    
+    Statt pro User einen eigenen PowerShell-Prozess zu starten (teuer: 1-3s Startup),
+    werden bis zu BATCH_SIZE User in einem einzigen PowerShell-Aufruf abgefragt.
+    Ein Semaphore begrenzt die max. gleichzeitigen PowerShell-Prozesse.
+    """
+    
+    BATCH_SIZE = 10           # Max User pro PowerShell-Aufruf
+    PS_TIMEOUT_BASE = 8       # Basis-Timeout in Sekunden (PowerShell Startup)
+    PS_TIMEOUT_PER_USER = 1.5 # Zusätzlich pro User im Batch
+    MAX_CONCURRENT_PS = 2     # Max gleichzeitige PowerShell-Prozesse
+    TIMEOUT_RETRY_SECS = 300  # Timeout-User nach 5 Min erneut versuchen
     
     def __init__(self, domain: str = 'patec.group', cache_file: str = 'ad_cache.json', 
-                 failed_retry_hours: int = 0.2):  
+                 failed_retry_hours: float = 1.0):  # 1 Stunde statt vorher 12 Minuten
         self.domain = domain
         self.cache_file = cache_file
         self.failed_retry_seconds = failed_retry_hours * 3600 
         self._cache: Dict[str, str] = {}
-        self._failed_users: Dict[str, float] = {}
+        self._failed_users: Dict[str, float] = {}  # username -> timestamp
+        self._processing: set = set()  # Verhindert doppelte Verarbeitung
         self._lock = threading.Lock()
-        self._queue: "queue.Queue[str]" = queue.Queue(maxsize=2000)
+        self._queue: "queue.Queue[str]" = queue.Queue(maxsize=4000)
         self._stop_event = threading.Event()
+        self._work_available = threading.Event()  # Signalisiert Worker: Arbeit verfügbar
+        self._last_save = time.time()
+        self._ps_semaphore = threading.Semaphore(self.MAX_CONCURRENT_PS)
         
         self._load_cache()
 
@@ -53,10 +94,12 @@ class ADLocationLookup:
             worker.start()
             self._workers.append(worker)
         
-        logger.info(f"AD Location Lookup mit optimiertem PowerShell gestartet (Domain: {domain}, {len(self._workers)} Workers)")
+        logger.info(f"AD Location Lookup gestartet (Domain: {domain}, Batch={self.BATCH_SIZE}, "
+                     f"Timeout={self.PS_TIMEOUT_BASE}+{self.PS_TIMEOUT_PER_USER}/User, "
+                     f"MaxPS={self.MAX_CONCURRENT_PS}, {len(self._workers)} Workers)")
 
     def stop(self):
-        """Optional beim Shutdown aufrufen."""
+        """Beim Shutdown aufrufen."""
         logger.info("AD Lookup wird beendet...")
         self._stop_event.set()
         
@@ -69,7 +112,7 @@ class ADLocationLookup:
         for i, worker in enumerate(self._workers):
             if worker.is_alive():
                 logger.info(f"Warte auf Worker-{i}...")
-                worker.join(timeout=2)
+                worker.join(timeout=3)
                 if worker.is_alive():
                     logger.warning(f"Worker-{i} antwortet nicht")
         
@@ -88,7 +131,8 @@ class ADLocationLookup:
                     
                     cache_data = data.get('cache', {})
                     if cache_data:
-                        if isinstance(list(cache_data.values())[0], list):
+                        first_val = next(iter(cache_data.values()))
+                        if isinstance(first_val, list):
                             self._cache = {k: v[0] for k, v in cache_data.items()}
                             logger.info(f"Cache konvertiert: {len(self._cache)} User (Tupel -> String)")
                         else:
@@ -106,7 +150,7 @@ class ADLocationLookup:
                 logger.warning(f"Cache laden fehlgeschlagen: {e}")
 
     def _save_cache(self):
-        """Cache in Datei speichern"""
+        """Cache in Datei speichern (direkt, ohne os.replace wegen WinError 32)"""
         try:
             with self._lock:
                 data = {
@@ -115,18 +159,27 @@ class ADLocationLookup:
                     'timestamp': time.time()
                 }
             
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
+            # Direkt schreiben statt os.replace (vermeidet WinError 32)
+            for attempt in range(3):
+                try:
+                    with open(self.cache_file, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, indent=2)
+                    return  # Erfolg
+                except PermissionError:
+                    if attempt < 2:
+                        time.sleep(0.5)
+                    else:
+                        raise
                 
         except Exception as e:
             logger.warning(f"Cache speichern fehlgeschlagen: {e}")
 
     def get_location(self, username: str) -> str:
         """
-        Nicht-blockierender Lookup OHNE Cache-TTL:
-        - Cache wird NIE geleert (permanent)
-        - Nur Failed Users haben TTL und werden nach Zeit wieder versucht
-        - Neue User werden im Hintergrund abgefragt
+        Nicht-blockierender Lookup:
+        - Cache wird permanent gehalten (kein TTL für erfolgreiche Lookups)
+        - Failed Users haben TTL und werden nach Ablauf erneut versucht
+        - Neue User werden im Hintergrund per Batch abgefragt
         """
         username_clean = username.split("\\")[-1].split("@")[0]
         username_lower = username_clean.lower().strip()
@@ -139,93 +192,192 @@ class ADLocationLookup:
             if username_lower in self._cache:
                 return self._cache[username_lower]
             
+            # Bereits in Bearbeitung? Nicht nochmal einreihen
+            if username_lower in self._processing:
+                return "Unknown"
+            
             if username_lower in self._failed_users:
                 failed_time = self._failed_users[username_lower]
-                time_since_failed = now - failed_time
-                
-                if time_since_failed < self.failed_retry_seconds:
+                if now - failed_time < self.failed_retry_seconds:
                     return "Unknown"
                 else:
-                    logger.debug(f"Failed User '{username_lower}' wird nach {time_since_failed/3600:.1f}h wieder versucht")
+                    logger.debug(f"Failed User '{username_lower}' wird erneut versucht")
                     del self._failed_users[username_lower]
+            
+            # Markiere als "in Bearbeitung" BEVOR wir in die Queue legen
+            self._processing.add(username_lower)
 
         try:
             self._queue.put_nowait(username_lower)
+            self._work_available.set()  # Wecke Worker auf
         except queue.Full:
-            pass
+            with self._lock:
+                self._processing.discard(username_lower)
 
         return "Unknown"
 
     def _worker_loop(self):
-        """Hintergrundthread, der User aus der Queue abarbeitet und Cache füllt."""
+        """Worker-Thread mit Batch-Verarbeitung.
+        
+        Wartet auf Event statt zu pollen. Wird nur aktiv wenn Arbeit verfügbar ist.
+        """
         worker_id = threading.current_thread().name
         logger.info(f"{worker_id} gestartet")
         
         while not self._stop_event.is_set():
+            # Warte auf Arbeit (Event) statt zu pollen
+            if not self._work_available.wait(timeout=30):  # Max 30s warten
+                # Timeout: Queue noch leer oder alle Worker idle
+                continue
+            
             try:
+                # === Batch aus Queue sammeln ===
+                batch = []
                 try:
-                    username = self._queue.get(timeout=1.0)
+                    first = self._queue.get(timeout=0.1)
+                    if first == "__STOP__":
+                        logger.info(f"{worker_id}: Stop Signal erhalten")
+                        break
+                    batch.append(first)
                 except queue.Empty:
+                    # Event war gesetzt aber Queue leer - Event zurücksetzen
+                    if self._queue.empty():
+                        self._work_available.clear()
                     continue
-
-                if username == "__STOP__":
-                    logger.info(f"{worker_id}: Stop Signal erhalten")
-                    break
-
+                
+                # Weitere User ohne Blockieren sammeln (bis BATCH_SIZE)
+                while len(batch) < self.BATCH_SIZE:
+                    try:
+                        item = self._queue.get_nowait()
+                        if item == "__STOP__":
+                            self._queue.put("__STOP__")  # Für andere Worker zurücklegen
+                            break
+                        batch.append(item)
+                    except queue.Empty:
+                        break
+                
+                if not batch:
+                    continue
+                
+                # === Bereits gecachte/failed Users filtern ===
+                to_query = []
                 now = time.time()
-                with self._lock:
-                    if username in self._cache:
-                        self._queue.task_done()
-                        continue
+                for uname in batch:
+                    skip = False
+                    with self._lock:
+                        if uname in self._cache:
+                            self._processing.discard(uname)
+                            skip = True
+                        elif uname in self._failed_users:
+                            if now - self._failed_users[uname] < self.failed_retry_seconds:
+                                self._processing.discard(uname)
+                                skip = True
+                            else:
+                                del self._failed_users[uname]
                     
-                    if username in self._failed_users:
-                        failed_time = self._failed_users[username]
-                        if now - failed_time < self.failed_retry_seconds:
-                            self._queue.task_done()
-                            continue
-                        else:
-                            del self._failed_users[username]
-
-                logger.debug(f"{worker_id}: Verarbeite '{username}'")
+                    if skip:
+                        self._queue.task_done()
+                    else:
+                        to_query.append(uname)
+                
+                if not to_query:
+                    continue
+                
+                # === Batch AD-Abfrage ===
+                logger.info(f"{worker_id}: Batch-Abfrage für {len(to_query)} User")
                 
                 try:
-                    location = self._query_ad_powershell(username)
+                    results = self._query_ad_powershell_batch(to_query)
                 except Exception as e:
-                    logger.error(f"{worker_id}: Unerwarteter Fehler bei '{username}': {e}")
-                    location = None
-
+                    logger.error(f"{worker_id}: Batch-Fehler: {e}")
+                    results = {}
+                
+                # === Ergebnisse verarbeiten ===
                 with self._lock:
-                    if location and location != "Unknown":
-                        self._cache[username] = location
-                        self._failed_users.pop(username, None)
-                        cache_size = len(self._cache)
-                        logger.info(f"{worker_id}: '{username}' -> '{location}' erfolgreich (Cache: {cache_size} User)")
-                    else:
-                        self._failed_users[username] = now
-                        failed_count = len(self._failed_users)
-                        logger.info(f"{worker_id}: '{username}' als failed markiert (Failed: {failed_count} User)")
-
-                self._queue.task_done()
+                    for uname in to_query:
+                        result = results.get(uname)
+                        
+                        if uname in self._cache:
+                            # Bereits von anderem Worker gecacht
+                            pass
+                        elif result and result not in ("ERROR", "NOTFOUND", "TIMEOUT"):
+                            # Erfolg: City gefunden
+                            self._cache[uname] = result
+                            self._failed_users.pop(uname, None)
+                            logger.info(f"{worker_id}: '{uname}' -> '{result}' (Cache: {len(self._cache)})")
+                        elif result == "TIMEOUT":
+                            # Timeout: Retry nach 5 Minuten (nicht volle Stunde)
+                            self._failed_users[uname] = now - self.failed_retry_seconds + self.TIMEOUT_RETRY_SECS
+                            logger.warning(f"{worker_id}: '{uname}' Timeout (Retry in {self.TIMEOUT_RETRY_SECS}s)")
+                        else:
+                            # Genuinely failed/not found: volle Retry-Zeit
+                            self._failed_users[uname] = now
+                            logger.info(f"{worker_id}: '{uname}' failed (Failed: {len(self._failed_users)})")
+                        
+                        self._processing.discard(uname)
+                
+                for _ in to_query:
+                    self._queue.task_done()
+                
+                # Periodisch Cache speichern (alle 5 Min)
+                if time.time() - self._last_save > 300:
+                    self._save_cache()
+                    self._last_save = time.time()
                 
             except Exception as e:
                 logger.error(f"{worker_id}: Kritischer Fehler in Worker-Loop: {e}")
+                # Cleanup: batch-User aus _processing entfernen
+                with self._lock:
+                    for uname in batch:
+                        self._processing.discard(uname)
+                time.sleep(1)  # Tight-Loop-Prevention bei wiederholten Fehlern
                 
         logger.info(f"{worker_id} beendet")
 
-    def _query_ad_powershell(self, username: str) -> Optional[str]:
-        """Fallback: PowerShell AD-Abfrage"""
+    def _query_ad_powershell_batch(self, usernames: List[str]) -> Dict[str, Optional[str]]:
+        """Batch PowerShell AD-Abfrage für mehrere User in EINEM Prozess.
+        
+        Statt pro User einen eigenen PowerShell-Prozess zu starten (1-3s Overhead),
+        werden alle User in einem einzigen Aufruf abgefragt.
+        
+        Returns dict: {username: city_string | "TIMEOUT" | "ERROR" | "NOTFOUND" | None}
+        """
+        if not usernames:
+            return {}
+        
+        # PowerShell-Befehl für Batch-Abfrage bauen
+        # Single-Quotes in Usernamen escapen ('' in PowerShell)
+        safe_users = [u.replace("'", "''") for u in usernames]
+        user_list = ",".join(f"'{u}'" for u in safe_users)
+        
+        ps_command = (
+            f"$users = @({user_list})\n"
+            f"foreach ($u in $users) {{\n"
+            f"    try {{\n"
+            f"        $adUser = Get-ADUser $u -Server '{self.domain}' -Properties City -ErrorAction Stop\n"
+            f"        if ($adUser.City) {{\n"
+            f"            Write-Output \"$u=$($adUser.City)\"\n"
+            f"        }} else {{\n"
+            f"            Write-Output \"$u=NOTFOUND\"\n"
+            f"        }}\n"
+            f"    }} catch {{\n"
+            f"        Write-Output \"$u=ERROR\"\n"
+            f"    }}\n"
+            f"}}\n"
+        )
+        
+        timeout = self.PS_TIMEOUT_BASE + self.PS_TIMEOUT_PER_USER * len(usernames)
         process = None
+        username_set = set(usernames)
+        
+        # Semaphore: Warte max timeout Sekunden auf freien Slot
+        if not self._ps_semaphore.acquire(timeout=timeout):
+            logger.warning(f"PowerShell Semaphore timeout ({timeout}s) - alle {self.MAX_CONCURRENT_PS} Slots belegt")
+            return {u: "TIMEOUT" for u in usernames}
+        
         try:
-            ps_command = f"""
-            try {{
-                $user = Get-ADUser '{username}' -Server '{self.domain}' -Properties City -ErrorAction Stop
-                $city = $user.City
-                if ($city) {{ $city }} else {{ "Unknown" }}
-            }} catch {{ "Unknown" }}
-            """
-
             process = subprocess.Popen(
-                ["powershell", "-NoProfile", "-NoLogo", "-NonInteractive", 
+                ["powershell", "-NoProfile", "-NoLogo", "-NonInteractive",
                  "-ExecutionPolicy", "Bypass", "-Command", ps_command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -234,66 +386,59 @@ class ADLocationLookup:
             )
             
             try:
-                stdout, stderr = process.communicate(timeout=2)
+                stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                logger.warning(f"PowerShell timeout für '{username}' - Force-Kill")
-                try:
-                    # Force-Kill mit taskkill für gesamten Process-Tree
-                    subprocess.run(
-                        ['taskkill', '/F', '/T', '/PID', str(process.pid)],
-                        capture_output=True,
-                        timeout=1
-                    )
-                except:
-                    pass
-                process.kill()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    pass
-                return None
-
+                logger.warning(f"PowerShell Batch timeout ({timeout:.0f}s) für {len(usernames)} User - Force-Kill")
+                _kill_process_tree(process)
+                process = None  # Bereits gekillt
+                return {u: "TIMEOUT" for u in usernames}
+            
             if process.returncode != 0:
-                return None
-
-            stdout = (stdout or "").strip()
-            if not stdout or stdout == "Unknown":
-                return None
-
-            logger.debug(f"PowerShell: '{username}' -> '{stdout}'")
-            return stdout.strip()
-
+                logger.warning(f"PowerShell Batch rc={process.returncode}, "
+                               f"stderr={stderr[:200] if stderr else 'none'}")
+            
+            # Ausgabe parsen: "username=CityName" oder "username=ERROR/NOTFOUND"
+            results = {}
+            for line in (stdout or "").splitlines():
+                line = line.strip()
+                if '=' not in line:
+                    continue
+                parts = line.split('=', 1)
+                if len(parts) != 2:
+                    continue
+                user_key = parts[0].strip().lower()
+                value = parts[1].strip()
+                
+                if user_key in username_set:
+                    results[user_key] = value if value and value not in ("", "Unknown") else "NOTFOUND"
+            
+            return results
+            
         except Exception as e:
-            logger.warning(f"PowerShell Fehler für '{username}': {e}")
-            if process and process.poll() is None:
-                try:
-                    process.kill()
-                    process.wait(timeout=1)
-                except:
-                    pass
-            return None
+            logger.warning(f"PowerShell Batch Fehler: {e}")
+            _kill_process_tree(process)
+            process = None
+            return {u: "ERROR" for u in usernames}
         finally:
+            self._ps_semaphore.release()
             if process and process.poll() is None:
-                try:
-                    process.terminate()
-                    process.wait(timeout=0.5)
-                except:
-                    try:
-                        process.kill()
-                    except:
-                        pass
+                _kill_process_tree(process)
 
     def log_cache_stats(self):
         """Loggt aktuelle Cache-Statistiken"""
         with self._lock:
             total_users = len(self._cache)
             failed_users = len(self._failed_users)
+            processing = len(self._processing)
+            queue_size = self._queue.qsize()
             
-            logger.info(f"CACHE STATS: {total_users} User permanent gecacht, {failed_users} failed [PowerShell]")
+            logger.info(f"CACHE STATS: {total_users} gecacht, {failed_users} failed, "
+                         f"{processing} in Bearbeitung, {queue_size} in Queue")
 
     def preload_users_async(self, usernames: List[str]) -> None:
         """Legt eine Liste von Usern in die Queue, ohne zu blockieren."""
         now = time.time()
+        queued = 0
         for name in usernames:
             uname = name.lower().strip()
             if not uname:
@@ -301,18 +446,25 @@ class ADLocationLookup:
             with self._lock:
                 if uname in self._cache:
                     continue
-                
+                if uname in self._processing:
+                    continue
                 if uname in self._failed_users:
                     failed_time = self._failed_users[uname]
                     if now - failed_time < self.failed_retry_seconds:
                         continue
                     else:
                         del self._failed_users[uname]
-                        
+                self._processing.add(uname)
             try:
                 self._queue.put_nowait(uname)
+                queued += 1
             except queue.Full:
+                with self._lock:
+                    self._processing.discard(uname)
                 break
+        if queued > 0:
+            self._work_available.set()  # Wecke Worker auf
+        logger.info(f"Preload: {queued} User in Queue eingereiht")
 
 
 class FlexLMExporter:
@@ -371,24 +523,17 @@ class FlexLMExporter:
                 return stdout or '', stderr or '', process.returncode
             except subprocess.TimeoutExpired:
                 logger.warning(f"lmstat timeout für {self.name} - Force-Kill")
+                _kill_process_tree(process)
+                # Pipes nach Kill schließen (verhindert Deadlock)
                 try:
-                    subprocess.run(
-                        ['taskkill', '/F', '/T', '/PID', str(process.pid)],
-                        capture_output=True,
-                        timeout=2
-                    )
-                except:
+                    process.stdout.close()
+                    process.stderr.close()
+                except Exception:
                     pass
-                process.kill()
-                process.wait()
                 return '', 'timeout', -2
                 
         except Exception as e:
-            if process and process.poll() is None:
-                try:
-                    process.kill()
-                except:
-                    pass
+            _kill_process_tree(process)
             return '', str(e), -1
     
     def parse_lmstat_output(self, output: str) -> Dict:
@@ -541,7 +686,7 @@ class MultiFlexLMExporter:
         
         logger.info(f"Multi-FlexLM Exporter initialisiert mit {len(self.servers)} Servern [PowerShell]")
         
-        self._collecting_enabled = False
+        self._collect_lock = threading.Lock()
 
     def _load_config(self) -> dict:
         """Lade Konfiguration aus YAML-Datei"""
@@ -555,41 +700,62 @@ class MultiFlexLMExporter:
         return config
 
     def collect_metrics(self):
-        """Sammle Metrics von allen Servern - PARALLEL statt sequentiell"""
-        all_users = []
-        results = {}
+        """Sammle Metrics von allen Servern - PARALLEL mit TOTAL-Timeout"""
+        if not self._collect_lock.acquire(blocking=False):
+            logger.warning("Collect bereits aktiv, überspringe")
+            return []
         
-        def collect_one(server):
-            try:
-                return server.name, server.collect_metrics()
-            except Exception as e:
-                logger.error(f"Fehler beim Sammeln von {server.name}: {e}")
-                return server.name, []
-        
-        # Starte alle Server parallel
-        threads = []
-        for server in self.servers:
-            t = threading.Thread(target=lambda s=server: results.update([collect_one(s)]), daemon=True)
-            t.start()
-            threads.append(t)
-        
-        # Warte max 45 Sekunden auf alle Threads
-        for t in threads:
-            t.join(timeout=45)
-            if t.is_alive():
-                logger.warning(f"Thread noch aktiv nach 45s timeout")
-        
-        # Sammle alle User
-        for users in results.values():
-            if users:
-                all_users.extend([u['username'] for u in users])
-        
-        return all_users
+        try:
+            collect_start = time.time()
+            logger.info("Starte Metrics Collection...")
+            all_users = []
+            results = {}
+            results_lock = threading.Lock()
+            
+            def collect_one(server):
+                try:
+                    name = server.name
+                    users = server.collect_metrics()
+                    with results_lock:
+                        results[name] = users
+                except Exception as e:
+                    logger.error(f"Fehler beim Sammeln von {server.name}: {e}")
+                    with results_lock:
+                        results[server.name] = []
+            
+            # Starte alle Server parallel
+            threads = []
+            for server in self.servers:
+                t = threading.Thread(target=collect_one, args=(server,), name=f"Collect-{server.name}", daemon=True)
+                t.start()
+                threads.append((t, server.name))
+            
+            # TOTAL-Timeout: Max 60s für ALLE Server zusammen (nicht pro Thread!)
+            total_deadline = time.time() + 60
+            for t, name in threads:
+                remaining = max(0, total_deadline - time.time())
+                if remaining <= 0:
+                    logger.warning(f"Total-Timeout! Server '{name}' übersprungen")
+                    continue
+                t.join(timeout=remaining)
+                if t.is_alive():
+                    logger.warning(f"Server '{name}' noch aktiv nach {time.time() - collect_start:.0f}s")
+            
+            # Sammle alle User
+            for users in results.values():
+                if users:
+                    all_users.extend([u['username'] for u in users])
+            
+            duration = time.time() - collect_start
+            logger.info(f"Collection fertig: {len(all_users)} User von {len(results)}/{len(self.servers)} Servern in {duration:.1f}s")
+            return all_users
+        finally:
+            self._collect_lock.release()
 
     def collect(self):
-        """Prometheus Collector Interface"""
-        if self._collecting_enabled:
-            self.collect_metrics()
+        """Prometheus Collector Interface - NICHT collect_metrics aufrufen!
+        Gauge-Werte werden im Hintergrund-Thread aktualisiert.
+        Prometheus liest einfach die aktuellen Werte."""
         return []
 
     def start_server(self, port: int = 9090):
@@ -614,8 +780,7 @@ class MultiFlexLMExporter:
         signal.signal(signal.SIGTERM, signal_handler)
         
         def initial_collect():
-            time.sleep(2)
-            self._collecting_enabled = True
+            time.sleep(3)
             logger.info("Starte Initial Collect für alle Server")
             try:
                 all_users = self.collect_metrics()
@@ -631,19 +796,27 @@ class MultiFlexLMExporter:
         threading.Thread(target=initial_collect, daemon=True).start()
         
         def collect_loop():
-            time.sleep(35)
-            while True:
+            time.sleep(40)
+            save_counter = 0
+            while not self.ad_lookup._stop_event.is_set():
                 try:
-                    time.sleep(60)  # 60s statt 30s
+                    # Interruptible sleep (statt time.sleep(60))
+                    if self.ad_lookup._stop_event.wait(timeout=60):
+                        break
+                    
+                    logger.info("Heartbeat: collect_loop startet nächste Runde")
                     self.collect_metrics()
                     
-                    if int(time.time()) % 600 < 60:
+                    save_counter += 1
+                    if save_counter % 5 == 0:  # Alle 5 Min
                         self.ad_lookup.log_cache_stats()
+                        self.ad_lookup._save_cache()
                         
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
                     logger.error(f"Collect error: {e}")
+            logger.info("Collect Loop beendet")
         
         threading.Thread(target=collect_loop, daemon=True).start()
         
